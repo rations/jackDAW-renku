@@ -74,6 +74,7 @@ enum {
     MSG_FILE_RENDER_REGION = 'frrg',
     MSG_FILE_NEW = 'fnew',
     MSG_OPEN_PROJECT_REFS = 'popn', // refs from the Open-Project panel (vs. load-file)
+    MSG_CONFIRM_SAVE = 'cfsv',      // save-before prompt reply: int32 "which" 0 Cancel, 1 No, 2 Yes
     // (Quit uses B_QUIT_REQUESTED.)
 
     // Menu bar — Edit.

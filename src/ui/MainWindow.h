@@ -1,5 +1,6 @@
 #pragma once
 
+#include <String.h>
 #include <Window.h>
 
 #include <vector>
@@ -70,7 +71,7 @@ private:
     void LoadFileAsTrack(const char *path);
 
     // Project save/load (single-mutator: all engine/project edits run here).
-    void SaveProjectTo(const char *path);   // write bundle, update title + last-project
+    bool SaveProjectTo(const char *path);   // write bundle, title, last-project; true = saved
     void ShowSaveAsPanel();                 // save panel seeded with the current name
     void ShowOpenPanel();                   // open panel in the projects dir
     void OpenProject(const char *path);     // stop, tear down, load, rebuild UI
@@ -79,6 +80,13 @@ private:
     void CloseAllMidiEditors();             // async-quit every piano-roll + drain
     void OpenFxEditor(JackDawTrack *track); // one FX window per track (raise if open)
     void CloseAllFxWindows();               // async-quit every FX window + drain
+    // Ask "Save changes before ...?" before something replaces the session
+    // (quit, New Session, Open Project). The project keeps no unsaved-changes
+    // flag, so it always asks. The action runs on No, or on Yes once the save
+    // succeeded; Cancel, Escape, a cancelled Save As or a failed save keep the
+    // session. Asynchronous: BAlert and the save panel reply by message.
+    void ConfirmSaveThen(int action, const char *question);
+    void RunPendingAction();
 
     // Render/export dialog (P11); region=TRUE renders the loop-tab selection.
     void OpenRenderDialog(bool region);
@@ -138,6 +146,13 @@ private:
     BFilePanel *m_load_panel; // "Load File as New Track" open panel (lazy)
     BFilePanel *m_save_panel; // "Save Project As" save panel (lazy)
     BFilePanel *m_open_panel; // "Open Project" open panel (lazy)
+
+    // Save-before-replacing prompt state (see ConfirmSaveThen).
+    enum { PENDING_NONE = 0, PENDING_QUIT, PENDING_NEW, PENDING_OPEN };
+    int m_pending_action;        // waiting on the prompt or its Save As
+    bool m_pending_save_as;      // the Save As panel is open for m_pending_action
+    bool m_quit_confirmed;       // QuitRequested may go ahead without asking
+    BString m_pending_open_path; // PENDING_OPEN: the project chosen
 
     RenderWindow *m_render_window; // render/export dialog (NULL until opened)
 

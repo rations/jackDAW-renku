@@ -5,6 +5,7 @@
 #include <Entry.h>
 #include <FilePanel.h>
 #include <InterfaceDefs.h>
+#include <Invoker.h>
 #include <LayoutBuilder.h>
 #include <LayoutItem.h>
 #include <Menu.h>
@@ -250,9 +251,10 @@ MainWindow::MainWindow(JackDawProject *project)
       m_metro_volume_window(NULL), m_countin_window(NULL), m_io_window(NULL),
       m_midictl_window(NULL), m_midictl_tick(NULL), m_mixer(NULL), m_mixer_item(NULL),
       m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f), m_load_panel(NULL),
-      m_save_panel(NULL), m_open_panel(NULL), m_render_window(NULL), m_render_thread(NULL),
-      m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE), m_render_active(false),
-      m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
+      m_save_panel(NULL), m_open_panel(NULL), m_pending_action(PENDING_NONE),
+      m_pending_save_as(false), m_quit_confirmed(false), m_render_window(NULL),
+      m_render_thread(NULL), m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE),
+      m_render_active(false), m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
 {
     memset(&m_render_prog, 0, sizeof(m_render_prog));
     // Restore the saved window frame (defaults match the BWindow rect above).
@@ -694,22 +696,72 @@ void MainWindow::UpdateTitle()
     }
 }
 
-void MainWindow::SaveProjectTo(const char *path)
+bool MainWindow::SaveProjectTo(const char *path)
 {
     if (!path || !*path)
-        return;
+        return false;
     if (jackdaw_project_save(m_project, path)) {
         BString msg("Could not save project to:\n");
         msg << path;
         (new BAlert("Save error", msg.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT))
             ->Go();
-        return;
+        return false;
     }
     UpdateTitle();
     const gchar *saved = jackdaw_project_get_file(m_project);
     if (saved && *saved)
         settings_set_string("last_project", saved);
     settings_save();
+    return true;
+}
+
+void MainWindow::ConfirmSaveThen(int action, const char *question)
+{
+    // One prompt at a time: a second Quit/New/Open while one is up is dropped.
+    if (m_pending_action != PENDING_NONE)
+        return;
+    m_pending_action = action;
+    m_pending_save_as = false;
+
+    BString text(question);
+    text << "\n\n";
+    const gchar *cur = jackdaw_project_get_file(m_project);
+    if (cur && *cur) {
+        gchar *base = g_path_get_basename(cur);
+        text << base;
+        g_free(base);
+    } else {
+        text << "This session has never been saved.";
+    }
+    // Buttons 0 Cancel, 1 No, 2 Yes; BAlert makes the last one the default.
+    BAlert *alert = new BAlert("Save changes", text.String(), "Cancel", "No", "Yes",
+                               B_WIDTH_AS_USUAL, B_OFFSET_SPACING, B_WARNING_ALERT);
+    alert->SetShortcut(0, B_ESCAPE);
+    alert->Go(new BInvoker(new BMessage(MSG_CONFIRM_SAVE), this));
+}
+
+void MainWindow::RunPendingAction()
+{
+    int action = m_pending_action;
+    m_pending_action = PENDING_NONE;
+    m_pending_save_as = false;
+    switch (action) {
+        case PENDING_QUIT:
+            m_quit_confirmed = true;
+            PostMessage(B_QUIT_REQUESTED);
+            break;
+        case PENDING_NEW:
+            NewSession();
+            break;
+        case PENDING_OPEN: {
+            BString path(m_pending_open_path);
+            m_pending_open_path = "";
+            OpenProject(path.String());
+            break;
+        }
+        default:
+            break;
+    }
 }
 
 void MainWindow::ShowSaveAsPanel()
@@ -1268,13 +1320,59 @@ void MainWindow::MessageReceived(BMessage *message)
             break;
         case B_SAVE_REQUESTED: {
             // Result of the "Save Project As" save panel: directory + name.
+            bool saved = false;
             entry_ref dir;
             const char *name = NULL;
             if (message->FindRef("directory", &dir) == B_OK &&
                 message->FindString("name", &name) == B_OK && name && *name) {
                 BPath path(&dir);
                 path.Append(name);
-                SaveProjectTo(path.Path());
+                saved = SaveProjectTo(path.Path());
+            }
+            // A Save As opened by the save-before prompt: go on only if it saved.
+            if (m_pending_save_as) {
+                m_pending_save_as = false;
+                if (saved)
+                    RunPendingAction();
+                else
+                    m_pending_action = PENDING_NONE;
+            }
+            break;
+        }
+        case B_CANCEL: {
+            // A file panel closed. The save panel also sends this after a
+            // successful save (B_SAVE_REQUESTED comes first and has already
+            // cleared m_pending_save_as), so a pending Save As here means the
+            // user cancelled it: keep the session.
+            void *source = NULL;
+            if (message->FindPointer("source", &source) == B_OK && source == m_save_panel &&
+                m_pending_save_as) {
+                m_pending_save_as = false;
+                m_pending_action = PENDING_NONE;
+            }
+            break;
+        }
+        case MSG_CONFIRM_SAVE: {
+            int32 which = 0;
+            if (message->FindInt32("which", &which) != B_OK || m_pending_action == PENDING_NONE) {
+                m_pending_action = PENDING_NONE;
+                break;
+            }
+            if (which == 1) { // No: go ahead without saving
+                RunPendingAction();
+            } else if (which == 2) { // Yes: save first, through Save As if never saved
+                BString cur(jackdaw_project_get_file(m_project));
+                if (cur.Length() > 0) {
+                    if (SaveProjectTo(cur.String()))
+                        RunPendingAction();
+                    else
+                        m_pending_action = PENDING_NONE;
+                } else {
+                    m_pending_save_as = true;
+                    ShowSaveAsPanel();
+                }
+            } else { // Cancel / Escape
+                m_pending_action = PENDING_NONE;
             }
             break;
         }
@@ -1287,13 +1385,17 @@ void MainWindow::MessageReceived(BMessage *message)
             if (message->FindRef("refs", 0, &ref) == B_OK) {
                 BEntry entry(&ref, true);
                 BPath path;
-                if (entry.GetPath(&path) == B_OK)
-                    OpenProject(path.Path());
+                // Ask only once a project has been chosen, so cancelling the
+                // chooser never costs a prompt.
+                if (entry.GetPath(&path) == B_OK) {
+                    m_pending_open_path = path.Path();
+                    ConfirmSaveThen(PENDING_OPEN, "Save changes before opening another project?");
+                }
             }
             break;
         }
         case MSG_FILE_NEW:
-            NewSession();
+            ConfirmSaveThen(PENDING_NEW, "Save changes before starting a new session?");
             break;
 
         case MSG_FILE_RENDER:
@@ -1685,6 +1787,13 @@ void MainWindow::MessageReceived(BMessage *message)
 
 bool MainWindow::QuitRequested()
 {
+    // The close box, File -> Quit and an application quit all land here. Ask
+    // first; the prompt's reply posts B_QUIT_REQUESTED again once it may go.
+    if (!m_quit_confirmed) {
+        ConfirmSaveThen(PENDING_QUIT, "Save changes before exiting?");
+        return false;
+    }
+
     // Persist the window frame for next launch.
     {
         BRect f = Frame();
