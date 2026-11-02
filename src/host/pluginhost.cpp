@@ -881,8 +881,11 @@ extern "C" int pluginhost_scan_helper_main(int argc, char **argv)
 }
 
 /* A wedged helper must not stall the scan: the startup scan runs behind a
- * progress window, where an unbounded wait looks like a hung launch. */
-#define PH_SCAN_TIMEOUT_MS 15000
+ * progress window, where an unbounded wait looks like a hung launch. Generous
+ * all the same: a Windows plug-in loads through Wine and vstbridge, and an
+ * iLok-protected one took 20 s before its factory was ready (Linux JackDAW,
+ * on a Pi 5). */
+#define PH_SCAN_TIMEOUT_MS 60000
 #define PH_SCAN_MAX_OUTPUT (1u << 20) /* untrusted child output, bounded */
 
 /* Run the describe helper for one plug-in. Returns its stdout, or an empty
@@ -969,11 +972,16 @@ static gchar *ph_run_scan_helper(const char *fmt, const char *path)
  * ("VST3" or "VST2"); the helper prints "<fmt>\t<name>\t<category>" lines, and
  * those raw lines are what the cache stores. VST3 keys carry the class name
  * (path\nclass — one bundle has many classes); VST2 keys are just the path. */
+/* Set during an explicit Rescan: plug-ins cached as failed are probed again. */
+static gboolean ph_retry_failed;
+
 extern "C" void ph_scan_via_helper(const char *fmt, const char *path, GList **catalog)
 {
     gint64 mtime = ph_path_mtime(path, 0);
     GPtrArray *owned = NULL; /* freshly scanned rows, when it was a cache miss */
     PhCacheEnt *e = ph_cache_hit(path, mtime);
+    if (e && ph_retry_failed && e->lines->len == 0)
+        e = NULL; /* a remembered failure: probe it again */
     if (!e) {
         if (ph_progress_cb)
             ph_progress_cb(path, ph_progress_u);
@@ -1056,7 +1064,12 @@ extern "C" const GList *pluginhost_catalog(void)
 
 extern "C" void pluginhost_rescan(void)
 {
+    /* The user's way to retry a plug-in that failed before, such as one that
+     * timed out while its licence service was still starting. The startup scan
+     * keeps the failure, so a broken plug-in isn't probed on every launch. */
+    ph_retry_failed = TRUE;
     ph_do_scan();
+    ph_retry_failed = FALSE;
 }
 
 /* Persisted baseline of every plugin identity seen on the previous scan, used
