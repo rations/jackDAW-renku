@@ -194,6 +194,9 @@ void MidiControlWindow::RebuildRows()
         row.group = new StepperControl("group", "Grp", group_msg, -1, 63, 1, 0);
         row.group->SetValue(m.switch_group);
         row.group->SetTarget(this);
+        row.group->SetToolTip("Like a pedalboard: switches with the same group number turn each "
+                              "other's tracks off, and pressing the one that is on turns it off. "
+                              "Tracks without a switch in the group keep playing.");
 
         BMessage *rm_msg = new BMessage(MSG_MIDICTL_REMOVE);
         rm_msg->AddInt32("index", (int32)i);

@@ -84,6 +84,13 @@ typedef struct {
      * buffer_size_cb). Each slot is touched by at most one worker per cycle. */
     float *slot_L[JACKDAW_MAX_TRACKS];
     float *slot_R[JACKDAW_MAX_TRACKS];
+    /* The gain each slot ended its last cycle on, so a mute or fader change
+     * ramps across one period instead of stepping. Same ownership as slot_L/R:
+     * only the worker processing slot i this cycle reads or writes it. A track
+     * that takes over a freed slot starts from the old track's last gain; that
+     * costs one period's ramp, never a jump. */
+    float slot_gain_L[JACKDAW_MAX_TRACKS];
+    float slot_gain_R[JACKDAW_MAX_TRACKS];
     jack_nframes_t buf_size; /* current buffer size */
 
     /* Weak refs to active tracks — slots populated by engine_add_track */
@@ -1326,10 +1333,20 @@ static void engine_process_track(int i)
     float angle = (t->pan + 1.0f) * (float)M_PI_4;
     float gain_L = vol * cosf(angle);
     float gain_R = vol * sinf(angle);
+    /* Ramp from last cycle's gain. A mute used to cut at the period boundary,
+     * which clicked; Switch Group swapping one pedal track for another is now a
+     * one-period crossfade instead. */
+    float g_L = engine.slot_gain_L[i], g_R = engine.slot_gain_R[i];
+    float inv_n = nframes ? 1.0f / (float)nframes : 0.0f;
+    float dg_L = (gain_L - g_L) * inv_n, dg_R = (gain_R - g_R) * inv_n;
+    engine.slot_gain_L[i] = gain_L;
+    engine.slot_gain_R[i] = gain_R;
     float peak_L = 0.0f, peak_R = 0.0f;
     for (k = 0; k < nframes; k++) {
-        float sL = bL[k] * gain_L;
-        float sR = bR[k] * gain_R;
+        g_L += dg_L;
+        g_R += dg_R;
+        float sL = bL[k] * g_L;
+        float sR = bR[k] * g_R;
         bL[k] = sL;
         bR[k] = sR;
         float aL = fabsf(sL), aR = fabsf(sR);

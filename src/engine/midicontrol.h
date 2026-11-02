@@ -37,7 +37,8 @@ typedef enum {
     ACT_SET_MIX,           /* CC value 0..127 -> wet/dry 0..1 */
     ACT_SET_PARAM,         /* CC value 0..127 -> plugin parameter (normalized) */
     ACT_TOGGLE_MUTE,       /* press flips one track's mute */
-    ACT_SWITCH_GROUP,      /* press unmutes my track, mutes the group's others */
+    ACT_SWITCH_GROUP,      /* pedalboard: press unmutes my track and mutes the
+                            * group's others; pressing it again mutes it */
     ACT_TRANSPORT_PLAY,    /* press toggles play/stop */
     ACT_TRANSPORT_STOP,    /* press stops */
     ACT_TRANSPORT_REC,     /* press toggles record */
@@ -63,6 +64,9 @@ typedef struct {
 typedef void (*MidiCtlTransportFn)(int which, gpointer user);
 /* Fired after MIDI learn captures a binding, so an open window can refresh. */
 typedef void (*MidiCtlChangedFn)(gpointer user);
+/* Fired after a mapping changes an effect's bypass or wet/dry on track `t`, so an
+ * open FX window can show the new state. */
+typedef void (*MidiCtlFxFn)(JackDawTrack *t, gpointer user);
 
 void midicontrol_init(void);
 void midicontrol_shutdown(void);
@@ -83,6 +87,7 @@ void midicontrol_dispatch_event(JackDawProject *p, const guint8 *data, guint8 si
 
 void midicontrol_set_transport_cb(MidiCtlTransportFn fn, gpointer user);
 void midicontrol_set_changed_cb(MidiCtlChangedFn fn, gpointer user);
+void midicontrol_set_fx_cb(MidiCtlFxFn fn, gpointer user);
 
 /* Per-project persistence (mappings reference track/FX indices). */
 void midicontrol_save_keyfile(GKeyFile *kf);

@@ -11,6 +11,8 @@ static MidiCtlTransportFn g_transport_cb;
 static gpointer g_transport_user;
 static MidiCtlChangedFn g_changed_cb;
 static gpointer g_changed_user;
+static MidiCtlFxFn g_fx_cb;
+static gpointer g_fx_user;
 
 /* ---- Lifecycle / table management ------------------------------------- */
 
@@ -99,6 +101,12 @@ void midicontrol_set_changed_cb(MidiCtlChangedFn fn, gpointer u)
     g_changed_user = u;
 }
 
+void midicontrol_set_fx_cb(MidiCtlFxFn fn, gpointer u)
+{
+    g_fx_cb = fn;
+    g_fx_user = u;
+}
+
 /* ---- Event parsing ----------------------------------------------------- */
 
 typedef struct {
@@ -183,6 +191,14 @@ static PluginInstance *resolve_inst(JackDawProject *p, const MidiCtlMapping *m)
     return (PluginInstance *)jackdaw_track_fx_get(t, (guint)m->fx_index);
 }
 
+/* Tell an open FX window that a mapping changed bypass or wet/dry. Without it
+ * the window's enable checkbox and Dry/Wet slider kept showing the old state. */
+static void notify_fx(JackDawProject *p, const MidiCtlMapping *m)
+{
+    if (g_fx_cb)
+        g_fx_cb(resolve_track(p, m->track_index), g_fx_user);
+}
+
 /* ---- Dispatch ---------------------------------------------------------- */
 
 void midicontrol_dispatch_event(JackDawProject *p, const guint8 *data, guint8 size)
@@ -223,8 +239,10 @@ void midicontrol_dispatch_event(JackDawProject *p, const guint8 *data, guint8 si
                 if (!e.press)
                     break;
                 PluginInstance *inst = resolve_inst(p, m);
-                if (inst)
-                    pluginhost_set_active(inst, !pluginhost_is_active(inst));
+                if (!inst)
+                    break;
+                pluginhost_set_active(inst, !pluginhost_is_active(inst));
+                notify_fx(p, m);
                 break;
             }
             case ACT_MOMENTARY_BYPASS: {
@@ -233,12 +251,15 @@ void midicontrol_dispatch_event(JackDawProject *p, const guint8 *data, guint8 si
                     break;
                 gboolean on = (e.type == MIDI_CTL_CC) ? (e.value >= 64) : e.press;
                 pluginhost_set_active(inst, on);
+                notify_fx(p, m);
                 break;
             }
             case ACT_SET_MIX: {
                 PluginInstance *inst = resolve_inst(p, m);
-                if (inst)
-                    pluginhost_set_mix(inst, (float)e.value / 127.0f);
+                if (!inst)
+                    break;
+                pluginhost_set_mix(inst, (float)e.value / 127.0f);
+                notify_fx(p, m);
                 break;
             }
             case ACT_SET_PARAM: {
@@ -267,6 +288,33 @@ void midicontrol_dispatch_event(JackDawProject *p, const guint8 *data, guint8 si
                 JackDawTrack *t = resolve_track(p, m->track_index);
                 if (!t)
                     break;
+                /* Like a stomp box: pressing the pedal that is on turns it off.
+                 * "On" means it is the group's only unmuted track -- in a fresh
+                 * project every track is unmuted, and the first press must select
+                 * its pedal, not mute it. Tracks outside the group (backing,
+                 * drums) are never touched. */
+                if (!jackdaw_track_is_muted(t)) {
+                    gboolean others_on = FALSE;
+                    for (guint j = 0; j < mappings->len && !others_on; j++) {
+                        MidiCtlMapping *om = &g_array_index(mappings, MidiCtlMapping, j);
+                        if (om->action != ACT_SWITCH_GROUP)
+                            continue;
+                        if (om->switch_group != m->switch_group)
+                            continue;
+                        if (om->track_index == m->track_index)
+                            continue;
+                        JackDawTrack *ot = resolve_track(p, om->track_index);
+                        if (ot && !jackdaw_track_is_muted(ot))
+                            others_on = TRUE;
+                    }
+                    if (!others_on) {
+                        jackdaw_track_set_muted(t, TRUE);
+                        break;
+                    }
+                }
+                /* Unmute the new pedal BEFORE muting the rest: the RT workers read
+                 * each track's flag independently, so this order can at worst give
+                 * one period with both pedals sounding, never one with neither. */
                 jackdaw_track_set_muted(t, FALSE);
                 /* Mute every other track that belongs to the same switch group. */
                 for (guint j = 0; j < mappings->len; j++) {

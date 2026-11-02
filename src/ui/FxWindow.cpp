@@ -121,6 +121,7 @@ enum {
     MSG_FX_MIX = 'fxmx',
     MSG_FX_PARAM = 'fxpm', // int32 "param" (index into the instance's params)
     MSG_FX_RAISE = 'fxrs', // re-activate an already-open window
+    MSG_FX_SYNC = 'fxsy',  // MIDI control changed bypass/mix: show the new state
 
     // Drum rack (DRUMku). All carry int32 "slot" except Add and Poll.
     MSG_DRUM_LOAD = 'dkld',      // open a file panel for a slot
@@ -648,6 +649,11 @@ void FxWindow::MessageReceived(BMessage *message)
     switch (message->what) {
         case MSG_FX_RAISE:
             Activate();
+            break;
+
+        case MSG_FX_SYNC:
+            // SetValue does not invoke, so this cannot echo back as a click.
+            SyncControlsRow();
             break;
 
         case MSG_FX_ADD: {

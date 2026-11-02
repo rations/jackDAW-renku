@@ -68,6 +68,19 @@ static void midictl_changed_cb(void *user)
 {
     static_cast<MainWindow *>(user)->SendMidiCtlSnapshot();
 }
+// A mapping changed an effect's bypass or wet/dry on `t`: let its open FX
+// window show it. Runs on this window's thread (the MIDI-control poll), the
+// thread that owns the track's "fx-window" pointer; the FX window refreshes on
+// its own looper.
+static void midictl_fx_cb(JackDawTrack *t, void *user)
+{
+    (void)user;
+    if (!t)
+        return;
+    FxWindow *fw = (FxWindow *)g_object_get_data(G_OBJECT(t), "fx-window");
+    if (fw)
+        fw->PostMessage('fxsy'); // MSG_FX_SYNC
+}
 
 // Fixed height of the docked mixer pane. Showing it grows the window by this
 // much so the mixer docks under the timeline without shrinking it.
@@ -296,6 +309,7 @@ MainWindow::MainWindow(JackDawProject *project)
     midicontrol_init();
     midicontrol_set_transport_cb(midictl_transport_cb, this);
     midicontrol_set_changed_cb(midictl_changed_cb, this);
+    midicontrol_set_fx_cb(midictl_fx_cb, this);
     m_midictl_tick =
         new BMessageRunner(BMessenger(this), BMessage(MSG_MIDICTL_POLL), kMidiCtlPollUsec);
 }
