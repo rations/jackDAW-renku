@@ -1930,7 +1930,12 @@ gboolean jackdaw_engine_init(JackDawProject *project)
             engine_process,     engine_buffer_size_cb, engine_thread_init_cb,  engine_xrun_cb,
             engine_shutdown_cb, engine_port_reg_cb,    engine_port_connect_cb,
         };
-        be = audio_backend_load(err, sizeof err);
+        /* JACK unless JACKDAW_BACKEND or the "audioBackend" setting says
+         * "mediakit" (the RenkuOS media services). */
+        const char *env = g_getenv("JACKDAW_BACKEND");
+        gchar *which = env ? g_strdup(env) : settings_get_string("audioBackend", "jack");
+        be = audio_backend_load(which, err, sizeof err);
+        g_free(which);
         if (!be) {
             jackdaw_error(err[0] ? err : "No audio backend is available.");
             return TRUE;

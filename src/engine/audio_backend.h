@@ -114,9 +114,9 @@ typedef struct JdBackend {
     int (*create_rt_thread)(pthread_t *thread, void *(*fn)(void *), void *arg);
 } JdBackend;
 
-/* Engine side: the backend to use. NULL, with a message for the user in err,
- * if there is none. */
-const JdBackend *audio_backend_load(char *err, size_t err_len);
+/* Engine side: the backend named `which` ("jack", the default, or "mediakit").
+ * NULL, with a message for the user in err, if it is not available. */
+const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len);
 
 /* Entry point a backend exports (looked up by name when it is an add-on).
  * Returns NULL if it does not speak `abi`. */

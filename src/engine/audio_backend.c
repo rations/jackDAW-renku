@@ -1,6 +1,7 @@
 /* audio_backend.c — find and load the engine's audio backend.
  *
- * The JACK backend is an add-on (jack.so), so JackDAW itself does not link
+ * The Media Kit backend ("mediakit") is built into JackDAW: it needs only the
+ * system's libmedia. The JACK backend is an add-on (jack.so), so JackDAW itself does not link
  * libjack and starts on a system without JACK installed. It is looked for in
  * this order, and the first one that loads is used for the rest of the run
  * (it is never unloaded: the engine holds its function table):
@@ -80,8 +81,18 @@ static void app_dir(char *out, size_t len)
     }
 }
 
-const JdBackend *audio_backend_load(char *err, size_t err_len)
+/* src/backend/mediakit/mediakit_backend.cpp */
+const JdBackend *jackdaw_mediakit_backend_entry(uint32_t abi);
+
+const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len)
 {
+    if (which && strcmp(which, "mediakit") == 0) {
+        const JdBackend *mk = jackdaw_mediakit_backend_entry(JD_BACKEND_ABI);
+        if (!mk && err && err_len)
+            snprintf(err, err_len, "The Media Kit backend does not match this JackDAW.");
+        return mk;
+    }
+
     status_t why = B_ENTRY_NOT_FOUND;
     const JdBackend *b;
 
