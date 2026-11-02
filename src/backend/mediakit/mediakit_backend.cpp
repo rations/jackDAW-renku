@@ -86,8 +86,13 @@ const int32 kMaxInputs = 16;     // input connections
 const int32 kMaxInChannels = 64; // channels per input connection
 const int32 kMidiMaxEvents = 256;
 const int32 kMetronomeJack = kMaxJacks - 1;
-const int32 kFifoPeriods = 8;  // FIFO capacity, in periods
-const int32 kPrimePeriods = 2; // start reading an input at this fill
+const int32 kFifoPeriods = 8; // FIFO capacity, in periods
+// An input is read once it holds this much (in half periods): one period at
+// first, the least that lets a cycle run at all. Each time it runs dry the
+// wait grows by half a period, up to two, so the margin for a device's
+// delivery jitter is only paid where it is needed.
+const int32 kPrimeHalvesFirst = 2;
+const int32 kPrimeHalvesMax = 4;
 
 const char *kClientPrefix = "jackdaw:";
 const char *kCapturePrefix = "media:";
@@ -158,7 +163,8 @@ struct Input {
     uint64 written = 0, read = 0; // frames; control thread only
     float *scratch = NULL;        // this cycle, planar: channels x period
     bool primed = false;
-    bigtime_t lastEnd = 0; // performance time after the newest frame
+    int32 primeHalves = kPrimeHalvesFirst; // fill to start reading at
+    bigtime_t lastEnd = 0;                 // performance time after the newest frame
     std::atomic<int32> latencyFrames{0};
 };
 
@@ -554,6 +560,7 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
     in->channels = ch;
     in->written = in->read = 0;
     in->primed = false;
+    in->primeHalves = kPrimeHalvesFirst;
     in->lastEnd = 0;
     in->latencyFrames.store(0);
     in->input.source = producer;
@@ -634,11 +641,25 @@ status_t JdMediaNode::GetLatencyFor(const media_destination &dest, bigtime_t *la
     return B_OK;
 }
 
-status_t JdMediaNode::FormatChanged(const media_source & /*producer*/,
-                                    const media_destination & /*consumer*/, int32 /*changeTag*/,
-                                    const media_format & /*format*/)
+status_t JdMediaNode::FormatChanged(const media_source &producer, const media_destination &consumer,
+                                    int32 /*changeTag*/, const media_format &format)
 {
-    return B_MEDIA_BAD_FORMAT;
+    // A producer's new buffer length (multi_audio's "Buffer size" setting)
+    // is fine: frames go through the FIFO whatever the buffer length, as long
+    // as a buffer fits in half of it. Anything else would need new FIFOs.
+    Input *in = _FindInput(consumer);
+    if (!in || !in->connected || in->input.source != producer || format.type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    const media_raw_audio_format &now = in->input.format.u.raw_audio;
+    const media_raw_audio_format &a = format.u.raw_audio;
+    size_t frameBytes = sample_size(a.format) * a.channel_count;
+    if (fabsf(a.frame_rate - now.frame_rate) > 0.5f || a.channel_count != now.channel_count ||
+        a.format != now.format || a.byte_order != now.byte_order || frameBytes == 0 ||
+        a.buffer_size / frameBytes > in->capFrames / 2)
+        return B_MEDIA_BAD_FORMAT;
+    BAutolock lock(fInputLock);
+    in->input.format = format;
+    return B_OK;
 }
 
 // ---- producer side ----
@@ -930,11 +951,13 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
         if (!in.connected)
             continue;
         uint64 avail = in.written - in.read;
-        if (!in.primed && avail >= (uint64)fPeriod * kPrimePeriods)
+        if (!in.primed && 2 * avail >= (uint64)fPeriod * in.primeHalves)
             in.primed = true;
         if (!in.primed || avail < (uint64)fPeriod) {
-            if (in.primed) { // ran dry: wait for it to refill
+            if (in.primed) { // ran dry: wait for it to refill, with more margin
                 in.primed = false;
+                if (in.primeHalves < kPrimeHalvesMax)
+                    in.primeHalves++;
                 notify_xrun();
             }
             memset(in.scratch, 0, sizeof(float) * fPeriod * in.channels);
