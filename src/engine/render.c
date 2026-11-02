@@ -236,7 +236,7 @@ typedef struct {
     int engine_sr;
     gboolean any_soloed;
     off_t frame;          /* set per block */
-    jack_nframes_t nn;    /* set per block */
+    jd_nframes_t nn;      /* set per block */
     float **trkL, **trkR; /* per-track post-fader scratch */
     PhMidiEvent **mev;    /* per-track MIDI gather buffer */
     gboolean *active;     /* OUT: did track i contribute? */
@@ -269,7 +269,7 @@ static void render_process_one_track(RenderPar *par, guint i)
             return;
     }
 
-    jack_nframes_t nn = par->nn;
+    jd_nframes_t nn = par->nn;
     float *tmpL = par->trkL[i];
     float *tmpR = par->trkR[i];
     gboolean instr = jackdaw_track_is_instrument(t);
@@ -295,7 +295,7 @@ static void render_process_one_track(RenderPar *par, guint i)
     gfloat vol = t->volume, pan = t->pan;
     float ang = (pan + 1.0f) * (float)M_PI_4;
     float gL = vol * cosf(ang), gR = vol * sinf(ang);
-    for (jack_nframes_t k = 0; k < nn; k++) {
+    for (jd_nframes_t k = 0; k < nn; k++) {
         tmpL[k] *= gL;
         tmpR[k] *= gR;
     }
@@ -444,8 +444,7 @@ static gpointer render_offline_thread(gpointer data)
 
     off_t frame = start;
     while (frame < end && !g_atomic_int_get(&prog->cancel)) {
-        jack_nframes_t nn =
-            (end - frame) < block ? (jack_nframes_t)(end - frame) : (jack_nframes_t)block;
+        jd_nframes_t nn = (end - frame) < block ? (jd_nframes_t)(end - frame) : (jd_nframes_t)block;
         memset(masterL, 0, nn * sizeof(float));
         memset(masterR, 0, nn * sizeof(float));
         pluginhost_set_transport(proj->bpm > 0.0 ? proj->bpm : 120.0, (double)engine_sr,
@@ -473,14 +472,14 @@ static gpointer render_offline_thread(gpointer data)
                 continue;
             const float *tl = trkL[i];
             const float *tr = trkR[i];
-            for (jack_nframes_t k = 0; k < nn; k++) {
+            for (jd_nframes_t k = 0; k < nn; k++) {
                 masterL[k] += tl[k];
                 masterR[k] += tr[k];
             }
         }
 
         /* Master volume / mute (this port has no master FX track). */
-        for (jack_nframes_t k = 0; k < nn; k++) {
+        for (jd_nframes_t k = 0; k < nn; k++) {
             masterL[k] *= master_vol;
             masterR[k] *= master_vol;
         }

@@ -1,14 +1,15 @@
 #ifndef JACKDAW_ENGINE_H_INCLUDED
 #define JACKDAW_ENGINE_H_INCLUDED
 
-#include <jack/jack.h>
+#include "audio_backend.h"
 #include "project.h"
 #include "track.h"
 
 G_BEGIN_DECLS
 
 /*
- * jackdaw-engine: one JACK client, named "jackdaw".
+ * jackdaw-engine: one client of the audio backend (audio_backend.h; JACK),
+ * named "jackdaw".
  *
  * Phase-1 registered ports:
  *   audio output: out_1 (L master), out_2 (R master)
@@ -187,8 +188,8 @@ void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch, guint8 velocity,
 gboolean jackdaw_engine_is_counting_in(void);
 
 /* Sample rate reported by JACK (valid after jackdaw_engine_init) */
-jack_nframes_t jackdaw_engine_get_sample_rate(void);
-jack_nframes_t jackdaw_engine_get_buffer_size(void);
+jd_nframes_t jackdaw_engine_get_sample_rate(void);
+jd_nframes_t jackdaw_engine_get_buffer_size(void);
 
 /* Monotonically-increasing playback position in samples.
  * Reset by jackdaw_engine_locate(); increments nframes per process cycle
@@ -221,7 +222,7 @@ gboolean jackdaw_engine_is_processing(void);
 typedef struct EngTrackReader EngTrackReader;
 EngTrackReader *engine_track_reader_new(JackDawTrack *t, int render_sr);
 void engine_track_reader_free(EngTrackReader *r);
-gboolean engine_track_reader_read(EngTrackReader *r, JackDawTrack *t, off_t start, jack_nframes_t n,
+gboolean engine_track_reader_read(EngTrackReader *r, JackDawTrack *t, off_t start, jd_nframes_t n,
                                   float *outL, float *outR);
 
 void jackdaw_engine_render_suspend(gboolean on);

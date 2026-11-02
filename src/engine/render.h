@@ -3,7 +3,7 @@
 
 #include <glib.h>
 #include <sys/types.h>
-#include <jack/jack.h> /* jack_nframes_t */
+#include "audio_backend.h" /* jd_nframes_t */
 #include "project.h"
 #include "host/pluginhost.h" /* PhMidiEvent for eng_gather_render_midi */
 
@@ -79,8 +79,8 @@ void jackdaw_render_options_save(const RenderOptions *o);
 /* Engine render primitive: emit an instrument track's sequenced MIDI events for
  * [blk_start, blk_start+nframes) into `mev` (cap entries). Defined in
  * jackdaw-engine.c; declared here because its signature needs PhMidiEvent. */
-int eng_gather_render_midi(JackDawTrack *t, off_t blk_start, jack_nframes_t nframes,
-                           PhMidiEvent *mev, int cap);
+int eng_gather_render_midi(JackDawTrack *t, off_t blk_start, jd_nframes_t nframes, PhMidiEvent *mev,
+                           int cap);
 
 G_END_DECLS
 

@@ -513,7 +513,7 @@ void MainWindow::TransportPause()
 void MainWindow::StepCursor(int direction)
 {
     // One step = 10 ms (samplerate / 100), matching the Linux |<< / >>| buttons.
-    jack_nframes_t sr = jackdaw_engine_get_sample_rate();
+    jd_nframes_t sr = jackdaw_engine_get_sample_rate();
     off_t step = (off_t)(sr / 100);
     off_t pos = jackdaw_engine_get_play_pos();
     if (direction < 0)

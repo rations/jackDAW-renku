@@ -38,7 +38,8 @@ C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c
               src/engine/tempomap.c src/engine/timeruler.c \
               src/engine/audio_clip.c src/engine/clipregion.c src/engine/undo.c \
               src/engine/midiclip.c src/engine/render.c src/engine/midicontrol.c \
-              src/engine/rt_ringbuffer.c
+              src/engine/rt_ringbuffer.c src/engine/audio_backend.c \
+              src/backend/jack/jack_backend.c
 CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/TransportView.cpp src/ui/TimelineView.cpp src/ui/RulerView.cpp \
               src/ui/TrackAreaView.cpp src/ui/StepperControl.cpp \
