@@ -87,11 +87,13 @@ const int32 kMaxInChannels = 64; // channels per input connection
 const int32 kMidiMaxEvents = 256;
 const int32 kMetronomeJack = kMaxJacks - 1;
 const int32 kFifoPeriods = 8; // FIFO capacity, in periods
-// An input is read once it holds this much (in half periods): one period at
-// first, the least that lets a cycle run at all. Each time it runs dry the
-// wait grows by half a period, up to two, so the margin for a device's
-// delivery jitter is only paid where it is needed.
-const int32 kPrimeHalvesFirst = 2;
+// An input is read once it holds this much (in half periods): a period and a
+// half at first. One period, the least that lets a cycle run at all, ran dry
+// once within seconds of connecting a UMC204HD at 1 ms -- a gap at the start
+// of the first take -- and then held. Each time it runs dry the wait grows by
+// half a period, up to two, so more margin for a device's delivery jitter is
+// only paid where it is needed.
+const int32 kPrimeHalvesFirst = 3;
 const int32 kPrimeHalvesMax = 4;
 
 const char *kClientPrefix = "jackdaw:";
