@@ -2,7 +2,7 @@
 #define TRACK_H_INCLUDED
 
 #include <glib-object.h>
-#include <jack/ringbuffer.h>
+#include "rt_ringbuffer.h"
 
 #include "audio_clip.h"
 #include "clipregion.h"
@@ -66,7 +66,7 @@ struct _JackDawTrack {
     /* MIDI capture ringbuffer: written by the RT callback while recording an
      * armed instrument track, drained on the main thread when recording stops
      * (turned into clip notes). Allocated with the play buffers. */
-    jack_ringbuffer_t *midi_rec_buf;
+    rt_ringbuffer_t *midi_rec_buf;
 
     /* RT-safe state: written atomically by main thread */
     volatile gint32 state_flags;
@@ -92,14 +92,14 @@ struct _JackDawTrack {
 
     /* Playback ringbuffers: fed by the feeder thread, drained by RT callback.
      * Allocated by jackdaw_engine_add_track() once the JACK rate is known. */
-    jack_ringbuffer_t *play_buf_L;
-    jack_ringbuffer_t *play_buf_R;
+    rt_ringbuffer_t *play_buf_L;
+    rt_ringbuffer_t *play_buf_R;
 
     /* Capture ringbuffers: written by the RT callback while recording, drained
      * by the recorder thread into a WAV file. Allocated with the play buffers.
      * A mono track duplicates its one input into both. */
-    jack_ringbuffer_t *rec_buf_L;
-    jack_ringbuffer_t *rec_buf_R;
+    rt_ringbuffer_t *rec_buf_L;
+    rt_ringbuffer_t *rec_buf_R;
 
     /* Recording anchor (timeline frame the take begins at) and the input port's
      * capture latency in frames, used to align the finalised clip under the

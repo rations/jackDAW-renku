@@ -28,15 +28,15 @@ static void jackdaw_track_finalize(GObject *obj)
     g_mutex_clear(&t->region_lock);
 
     if (t->play_buf_L)
-        jack_ringbuffer_free(t->play_buf_L);
+        rt_ringbuffer_free(t->play_buf_L);
     if (t->play_buf_R)
-        jack_ringbuffer_free(t->play_buf_R);
+        rt_ringbuffer_free(t->play_buf_R);
     if (t->rec_buf_L)
-        jack_ringbuffer_free(t->rec_buf_L);
+        rt_ringbuffer_free(t->rec_buf_L);
     if (t->rec_buf_R)
-        jack_ringbuffer_free(t->rec_buf_R);
+        rt_ringbuffer_free(t->rec_buf_R);
     if (t->midi_rec_buf)
-        jack_ringbuffer_free(t->midi_rec_buf);
+        rt_ringbuffer_free(t->midi_rec_buf);
     g_free((gpointer)t->rec_peak_buf);
 
     /* MIDI: drop the live snapshot + any retired ones, then the regions/clip. */
