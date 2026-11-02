@@ -112,6 +112,17 @@ struct Diag {
     std::atomic<int32> peakMilli{0};         // largest master sample, x1000
     std::atomic<int32> minLeadUs{INT32_MAX}; // least time between send and play
     std::atomic<int32> lateWake{0};          // cycles woken a period late
+    // Capture, for the first input that delivers a buffer on our time
+    // source: does it keep pace with the cycle?
+    std::atomic<int32> capInput{-1};    // which input is measured
+    std::atomic<int32> capBufs{0};      // buffers received (this report)
+    std::atomic<int32> capGaps{0};      // stamp stepped > 1.5 buffers (this report)
+    std::atomic<int32> capMaxStepUs{0}; // largest stamp step (this report)
+    std::atomic<int32> capDry{0};       // input ran dry in a cycle (this report)
+    std::atomic<int64> capFrames{0};    // frames since the first stamp
+    std::atomic<int64> capSpanUs{0};    // last stamp - first stamp
+    std::atomic<int64> capCycles0{0};   // fCycles at the first stamp
+    bigtime_t capFirst = 0, capPrev = 0; // control thread only
 };
 Diag gDiag;
 bool gDiagOn = false;
@@ -320,6 +331,7 @@ private:
     void _UpdateLatency();
     void _RunCycle(bigtime_t performanceTime, bigtime_t lateness);
     void _FillInputs(bigtime_t performanceTime);
+    void _DiagCapture(int32 index, bigtime_t start, uint32 frames);
     void _SendOutputs(bigtime_t performanceTime);
 
     float fRate;
@@ -623,7 +635,37 @@ void JdMediaNode::BufferReceived(BBuffer *buffer)
         in->lastEnd = h->start_time + (bigtime_t)(1000000.0 * frames / fRate);
     else
         in->lastEnd = TimeSource()->Now();
+    if (gDiagOn && h->time_source == TimeSource()->ID())
+        _DiagCapture(int32(in - fInputs), h->start_time, frames);
     buffer->Recycle();
+}
+
+/* JACKDAW_DIAG: capture stamps against the frames they carry. Control thread. */
+void JdMediaNode::_DiagCapture(int32 index, bigtime_t start, uint32 frames)
+{
+    int32 measured = gDiag.capInput.load(std::memory_order_relaxed);
+    if (measured < 0) {
+        gDiag.capInput.store(index, std::memory_order_relaxed);
+        gDiag.capCycles0.store(fCycles.load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        gDiag.capFirst = gDiag.capPrev = start;
+        gDiag.capFrames.store(0, std::memory_order_relaxed);
+        gDiag.capBufs.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (measured != index)
+        return;
+    bigtime_t step = start - gDiag.capPrev;
+    bigtime_t dur = (bigtime_t)(1000000.0 * frames / fRate);
+    if (step * 2 > dur * 3)
+        gDiag.capGaps.fetch_add(1, std::memory_order_relaxed);
+    if (step > gDiag.capMaxStepUs.load(std::memory_order_relaxed))
+        gDiag.capMaxStepUs.store((int32)step, std::memory_order_relaxed);
+    // Frames counted up to this buffer's start, so they match the span.
+    gDiag.capFrames.fetch_add(frames, std::memory_order_relaxed);
+    gDiag.capSpanUs.store(start - gDiag.capFirst, std::memory_order_relaxed);
+    gDiag.capPrev = start;
+    gDiag.capBufs.fetch_add(1, std::memory_order_relaxed);
 }
 
 void JdMediaNode::ProducerDataStatus(const media_destination & /*dest*/, int32 /*status*/,
@@ -958,6 +1000,8 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
                 in.primed = false;
                 if (in.primeHalves < kPrimeHalvesMax)
                     in.primeHalves++;
+                if (gDiagOn)
+                    gDiag.capDry.fetch_add(1, std::memory_order_relaxed);
                 notify_xrun();
             }
             memset(in.scratch, 0, sizeof(float) * fPeriod * in.channels);
@@ -1301,6 +1345,29 @@ void print_diag()
             (int)gDiag.lateNotes.exchange(0), (int)gDiag.lateUs.exchange(0),
             (int)gDiag.lateWake.exchange(0), gDiag.peakMilli.exchange(0) / 1000.0,
             lead == INT32_MAX ? -1 : (int)lead, (long long)gNode->CurrentEventLatency());
+
+    int32 capIn = gDiag.capInput.load(std::memory_order_relaxed);
+    if (capIn < 0)
+        return;
+    // Two rates against the capture's frame count, in parts per million:
+    // its own stamps (positive: the stamps run ahead of the frames, i.e.
+    // buffers are missing or short), and our cycle (positive: we consume
+    // faster than it delivers, so the input runs dry now and then).
+    double rate = gNode->Rate();
+    double frames = (double)gDiag.capFrames.load(std::memory_order_relaxed);
+    double span = (double)gDiag.capSpanUs.load(std::memory_order_relaxed);
+    double cycleFrames = (double)(gNode->fCycles.load() -
+                                  gDiag.capCycles0.load(std::memory_order_relaxed)) *
+                         gNode->Period();
+    double stampPpm = span > 0 ? (span - frames * 1e6 / rate) / span * 1e6 : 0;
+    double cyclePpm = frames > 0 ? (cycleFrames - frames) / frames * 1e6 : 0;
+    fprintf(stderr,
+            "JackDAW capture in %d: buffers %d, stamp gaps %d (largest step %d us), ran dry %d; "
+            "over %.1f s: stamps %+.1f ppm vs frames, cycle %+.1f ppm vs capture "
+            "(%+.0f frames)\n",
+            (int)capIn, (int)gDiag.capBufs.exchange(0), (int)gDiag.capGaps.exchange(0),
+            (int)gDiag.capMaxStepUs.exchange(0), (int)gDiag.capDry.exchange(0), span / 1e6,
+            stampPpm, cyclePpm, cycleFrames - frames);
 }
 
 // ---- the JdBackend table ----
