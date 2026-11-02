@@ -60,6 +60,7 @@
 #include <MediaEventLooper.h>
 #include <MediaNode.h>
 #include <MediaRoster.h>
+#include <MessageRunner.h>
 #include <Messenger.h>
 #include <OS.h>
 #include <TimeSource.h>
@@ -92,6 +93,23 @@ const char *kClientPrefix = "jackdaw:";
 const char *kCapturePrefix = "media:";
 
 enum { SEND_CYCLE_EVENT = BTimedEventQueue::B_USER_EVENT + 1 };
+enum { MSG_DIAG_REPORT = 'jdmd' };
+
+/* JACKDAW_DIAG counters: written by the control thread with relaxed atomics
+ * (no lock, no allocation), read and printed every 2 s by the roster
+ * watcher's thread. */
+struct Diag {
+    std::atomic<int32> sent{0};              // buffers handed to SendBuffer
+    std::atomic<int32> sendFail{0};          // SendBuffer refused them
+    std::atomic<int32> noBuffer{0};          // the buffer group was empty
+    std::atomic<int32> lateNotes{0};         // LateNoticeReceived
+    std::atomic<int32> lateUs{0};            // largest late notice, usecs
+    std::atomic<int32> peakMilli{0};         // largest master sample, x1000
+    std::atomic<int32> minLeadUs{INT32_MAX}; // least time between send and play
+    std::atomic<int32> lateWake{0};          // cycles woken a period late
+};
+Diag gDiag;
+bool gDiagOn = false;
 
 struct MidiBuffer {
     uint32 count;
@@ -212,7 +230,12 @@ public:
     RosterWatcher() : BLooper("JackDAW media watcher")
     {
     }
+    ~RosterWatcher() override
+    {
+        delete fDiagRunner;
+    }
     void MessageReceived(BMessage *message) override;
+    BMessageRunner *fDiagRunner = NULL;
 };
 
 class JdMediaNode : public BBufferConsumer, public BBufferProducer, public BMediaEventLooper
@@ -270,6 +293,10 @@ public:
     {
         return fPeriod;
     }
+    bigtime_t CurrentEventLatency() const
+    {
+        return EventLatency();
+    }
     Port fPorts[kMaxPorts];
     Jack fJacks[kMaxJacks];
     Input fInputs[kMaxInputs];
@@ -310,6 +337,8 @@ void notify_xrun()
         gCb.xrun(gArg);
 }
 
+void print_diag();
+
 void RosterWatcher::MessageReceived(BMessage *message)
 {
     switch (message->what) {
@@ -326,6 +355,9 @@ void RosterWatcher::MessageReceived(BMessage *message)
         case B_MEDIA_SERVER_QUIT:
             if (gCb.shutdown)
                 gCb.shutdown(gArg);
+            break;
+        case MSG_DIAG_REPORT:
+            print_diag();
             break;
         default:
             BLooper::MessageReceived(message);
@@ -699,7 +731,9 @@ status_t JdMediaNode::SetBufferGroup(const media_source &source, BBufferGroup *g
     OutConn *o = _FindOutput(source);
     if (!o || !o->reserved)
         return B_MEDIA_BAD_SOURCE;
-    if (group == o->group)
+    // NULL asks for our own group, so only a consumer's group already in use
+    // is a no-op.
+    if (group != NULL && group == o->group)
         return B_OK;
     delete o->group; // waits for its buffers to come back
     o->group = group;
@@ -807,6 +841,9 @@ void JdMediaNode::LateNoticeReceived(const media_source &what, bigtime_t howMuch
 {
     if (!_FindOutput(what))
         return;
+    gDiag.lateNotes.fetch_add(1, std::memory_order_relaxed);
+    if (howMuch > gDiag.lateUs.load(std::memory_order_relaxed))
+        gDiag.lateUs.store((int32)howMuch, std::memory_order_relaxed);
     notify_xrun();
     // A consumer got our buffer late: produce earlier from now on (bounded),
     // as SoundPlayNode does.
@@ -868,8 +905,10 @@ void JdMediaNode::_RunCycle(bigtime_t performanceTime, bigtime_t lateness)
             gCb.thread_init(gArg);
     }
     // Woken a whole period late: the cycle cannot make its deadline.
-    if (lateness > BufferDuration())
+    if (lateness > BufferDuration()) {
+        gDiag.lateWake.fetch_add(1, std::memory_order_relaxed);
         notify_xrun();
+    }
 
     _FillInputs(performanceTime);
     if (gCb.process)
@@ -958,6 +997,7 @@ void JdMediaNode::_SendOutputs(bigtime_t performanceTime)
             const media_raw_audio_format &a = o.output.format.u.raw_audio;
             BBuffer *buf = o.group->RequestBuffer(a.buffer_size, 0); // never wait
             if (!buf) {
+                gDiag.noBuffer.fetch_add(1, std::memory_order_relaxed);
                 notify_xrun();
                 continue;
             }
@@ -971,8 +1011,26 @@ void JdMediaNode::_SendOutputs(bigtime_t performanceTime)
             h->size_used = a.buffer_size;
             h->time_source = TimeSource()->ID();
             h->start_time = performanceTime;
-            if (SendBuffer(buf, o.output.source, o.output.destination) != B_OK)
+            if (gDiagOn) {
+                if (j == 0) {
+                    float peak = 0.0f;
+                    for (int32 c = 0; c < jk.channels; c++)
+                        for (int32 f = 0; chan[c] && f < fPeriod; f++)
+                            peak = fmaxf(peak, fabsf(chan[c][f]));
+                    int32 milli = (int32)(peak * 1000.0f);
+                    if (milli > gDiag.peakMilli.load(std::memory_order_relaxed))
+                        gDiag.peakMilli.store(milli, std::memory_order_relaxed);
+                }
+                int32 lead = (int32)(performanceTime - TimeSource()->Now());
+                if (lead < gDiag.minLeadUs.load(std::memory_order_relaxed))
+                    gDiag.minLeadUs.store(lead, std::memory_order_relaxed);
+            }
+            if (SendBuffer(buf, o.output.source, o.output.destination) != B_OK) {
+                gDiag.sendFail.fetch_add(1, std::memory_order_relaxed);
                 buf->Recycle();
+            } else {
+                gDiag.sent.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 }
@@ -1143,6 +1201,40 @@ media_node_id node_for_port(BMediaRoster *roster, port_id port)
     return -1;
 }
 
+/* Undo connections from hardware capture outputs to consumers that are gone.
+ * A node whose team died (a crash, or a kill) never disconnects, so
+ * multi_audio keeps the output reserved for it and refuses every new
+ * connection ("Already connected"). A consumer's destination port is its
+ * control port, which goes away with the team, so a dead port means a dead
+ * consumer. BMediaRoster::Disconnect only needs the producer's side for this
+ * (it queries the producer and consumer ports separately, MediaRoster.cpp). */
+void release_dead_capture_connections(BMediaRoster *roster)
+{
+    live_node_info nodes[64];
+    int32 count = 64;
+    if (roster->GetLiveNodes(nodes, &count, NULL, NULL, NULL, B_PHYSICAL_INPUT) != B_OK)
+        return;
+    for (int32 n = 0; n < count; n++) {
+        media_output outs[16];
+        int32 nouts = 0;
+        if (roster->GetConnectedOutputsFor(nodes[n].node, outs, 16, &nouts) != B_OK)
+            continue;
+        for (int32 o = 0; o < nouts; o++) {
+            port_info info;
+            if (get_port_info(outs[o].destination.port, &info) == B_OK)
+                continue; // the consumer is alive
+            // The consumer's node id is unknown (the node is gone); any valid
+            // id gets the producer side disconnected.
+            // The consumer half of this always fails (its port is gone), so
+            // the result says nothing; the producer side is what frees it.
+            roster->Disconnect(nodes[n].node.node, outs[o].source, nodes[n].node.node,
+                               outs[o].destination);
+            fprintf(stderr, "JackDAW media: released %s / %s from a consumer that is gone\n",
+                    nodes[n].name, outs[o].name);
+        }
+    }
+}
+
 /* Connect one of our jacks' free outputs to a free input of `consumer`. */
 status_t connect_jack(BMediaRoster *roster, int32 jack, const media_node &consumer)
 {
@@ -1171,6 +1263,23 @@ status_t connect_jack(BMediaRoster *roster, int32 jack, const media_node &consum
     return roster->Connect(free->source, in.destination, &fmt, &madeOut, &madeIn);
 }
 
+/* JACKDAW_DIAG: what the node did in the last 2 s. Runs on the watcher. */
+void print_diag()
+{
+    if (!gNode)
+        return;
+    int32 lead = gDiag.minLeadUs.exchange(INT32_MAX, std::memory_order_relaxed);
+    fprintf(stderr,
+            "JackDAW media: cycles %d, sent %d, send failed %d, no buffer %d, late notices %d "
+            "(max %d us), late wakes %d, master peak %.3f, least lead %d us, event latency "
+            "%lld us\n",
+            (int)gNode->fCycles.load(), (int)gDiag.sent.exchange(0),
+            (int)gDiag.sendFail.exchange(0), (int)gDiag.noBuffer.exchange(0),
+            (int)gDiag.lateNotes.exchange(0), (int)gDiag.lateUs.exchange(0),
+            (int)gDiag.lateWake.exchange(0), gDiag.peakMilli.exchange(0) / 1000.0,
+            lead == INT32_MAX ? -1 : (int)lead, (long long)gNode->CurrentEventLatency());
+}
+
 // ---- the JdBackend table ----
 
 int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, char *err,
@@ -1191,6 +1300,8 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
         snprintf(err, errLen, "Could not reach the media services: %s.", strerror(status));
         return -1;
     }
+    release_dead_capture_connections(roster);
+
     float rate = 48000.0f;
     int32 period = 512;
     if (!mixer_output_format(roster, &rate, &period))
@@ -1234,6 +1345,13 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
         // The server's own quit notice only goes to watchers that ask for it
         // by name (BMediaRoster::StartWatching, MediaRoster.cpp).
         roster->StartWatching(BMessenger(gWatcher), B_MEDIA_SERVER_QUIT);
+        const char *diag = getenv("JACKDAW_DIAG");
+        gDiagOn = diag && *diag && strcmp(diag, "0") != 0;
+        if (gDiagOn) {
+            BMessage report(MSG_DIAG_REPORT);
+            gWatcher->fDiagRunner =
+                new (std::nothrow) BMessageRunner(BMessenger(gWatcher), &report, 2000000);
+        }
     }
     return 0;
 }
@@ -1483,16 +1601,21 @@ void mk_free_ports(const char **ports)
 int mk_connect(const char *source, const char *destination)
 {
     Port *port = port_by_full_name(destination);
-    if (!port || port->type != JD_PORT_AUDIO || port->direction != JD_PORT_INPUT)
+    if (!port || port->type != JD_PORT_AUDIO || port->direction != JD_PORT_INPUT) {
+        fprintf(stderr, "JackDAW media: connect to %s: no such JackDAW capture port\n",
+                destination ? destination : "(null)");
         return -1;
+    }
     std::vector<CaptureSource> srcs;
     list_capture_sources(srcs);
     const CaptureSource *s = NULL;
     for (size_t i = 0; i < srcs.size() && !s; i++)
         if (strcmp(srcs[i].name, source) == 0)
             s = &srcs[i];
-    if (!s)
+    if (!s) {
+        fprintf(stderr, "JackDAW media: connect %s: no such capture source\n", source);
         return -1;
+    }
 
     int32 input = s->input;
     if (input < 0) {
@@ -1507,15 +1630,21 @@ int mk_connect(const char *source, const char *destination)
         media_input free;
         int32 n = 0;
         if (roster->GetFreeInputsFor(gNode->Node(), &free, 1, &n, B_MEDIA_RAW_AUDIO) != B_OK ||
-            n < 1)
+            n < 1) {
+            fprintf(stderr, "JackDAW media: connect %s: JackDAW has no free input\n", source);
             return -1;
+        }
         media_format fmt;
         fmt.type = B_MEDIA_RAW_AUDIO;
         fmt.u.raw_audio = media_raw_audio_format::wildcard;
         media_output madeOut;
         media_input madeIn;
-        if (roster->Connect(s->output.source, free.destination, &fmt, &madeOut, &madeIn) != B_OK)
+        status_t err = roster->Connect(s->output.source, free.destination, &fmt, &madeOut, &madeIn);
+        if (err != B_OK) {
+            fprintf(stderr, "JackDAW media: connecting %s to JackDAW failed: %s\n", source,
+                    strerror(err));
             return -1;
+        }
         BAutolock lock(gNode->fInputLock);
         input = find_input_from(madeOut.source);
         if (input < 0)
@@ -1525,8 +1654,11 @@ int mk_connect(const char *source, const char *destination)
     }
     BAutolock lock(gNode->fInputLock);
     const Input &in = gNode->fInputs[input];
-    if (!in.connected || s->channel >= in.channels)
+    if (!in.connected || s->channel >= in.channels) {
+        fprintf(stderr, "JackDAW media: connect %s: input %d is %s with %d channels\n", source,
+                (int)input, in.connected ? "connected" : "not connected", (int)in.channels);
         return -1;
+    }
     port->route.store(((int32)in.generation << 16) | (input << 8) | s->channel,
                       std::memory_order_release);
     return 0;

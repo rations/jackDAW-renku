@@ -30,9 +30,14 @@ int main(int argc, char **argv)
     {
         JackDawApp app(project);
         app.Run();
+        // Close the audio backend while the application object still exists:
+        // ~BApplication quits the loopers registered with it, BMediaRoster
+        // among them (MediaRoster.cpp registers it with be_app), and the
+        // Media Kit backend needs the roster to stop its node and undo its
+        // connections.
+        jackdaw_engine_quit();
     }
 
-    jackdaw_engine_quit();
     g_object_unref(project);
     pluginhost_shutdown();
     settings_quit();
