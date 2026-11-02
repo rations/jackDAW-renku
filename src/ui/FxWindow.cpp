@@ -15,6 +15,7 @@
 #include <Path.h>
 #include <PopUpMenu.h>
 #include <ScrollBar.h>
+#include <Screen.h>
 #include <ScrollView.h>
 #include <Slider.h>
 #include <StringItem.h>
@@ -415,7 +416,35 @@ void FxWindow::FitWindowToEmbeddedEditor()
     float have = m_embedded_ui->Frame().Width();
     if (have > 0.0f && want.width > have)
         targetW += want.width - have;
-    ResizeTo(targetW, editorH + kEditorChromeHeight);
+    float targetH = editorH + kEditorChromeHeight;
+
+    // Never taller than the screen, and kept on it: a window that grew went on
+    // downward from where it was first put, so a tall editor's bottom fell off
+    // the screen. The param area scrolls vertically (ParamGroupView's minimum
+    // height is small), so what does not fit scrolls. Width is not clamped: the
+    // layout keeps the window at least as wide as the editor's minimum, and
+    // the param area has no horizontal scroll bar, so an editor wider than the
+    // screen is still cut off at the right.
+    BRect screen = BScreen(this).Frame();
+    BRect frame = Frame();
+    BRect deco = DecoratorFrame();
+    float padL = frame.left - deco.left, padT = frame.top - deco.top;
+    float padR = deco.right - frame.right, padB = deco.bottom - frame.bottom;
+    float maxH = screen.Height() - padT - padB;
+    if (targetH > maxH)
+        targetH = maxH;
+    float x = frame.left, y = frame.top;
+    if (x + targetW + padR > screen.right)
+        x = screen.right - padR - targetW;
+    if (y + targetH + padB > screen.bottom)
+        y = screen.bottom - padB - targetH;
+    if (x - padL < screen.left)
+        x = screen.left + padL;
+    if (y - padT < screen.top)
+        y = screen.top + padT;
+    // Move first, so the new size never reaches past the screen edge.
+    MoveTo(x, y);
+    ResizeTo(targetW, targetH);
 }
 
 void FxWindow::ClearParamPanel()
