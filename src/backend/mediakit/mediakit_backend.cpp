@@ -334,6 +334,7 @@ private:
     void _RunCycle(bigtime_t performanceTime, bigtime_t lateness);
     void _FillInputs(bigtime_t performanceTime);
     void _DiagCapture(int32 index, bigtime_t start, uint32 frames);
+    void _DiagForgetCapture(int32 index);
     void _SendOutputs(bigtime_t performanceTime);
 
     float fRate;
@@ -581,6 +582,7 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
     in->input.format = format;
     in->generation++;
     in->connected = true;
+    _DiagForgetCapture(int32(in - fInputs));
     *input = in->input;
     return B_OK;
 }
@@ -594,6 +596,7 @@ void JdMediaNode::Disconnected(const media_source &producer, const media_destina
     in->connected = false;
     in->generation++; // routes to it go silent
     in->madeByUs = false;
+    _DiagForgetCapture(int32(in - fInputs));
     in->input.source = media_source::null;
     in->input.format.u.raw_audio = media_raw_audio_format::wildcard;
     in->input.format.u.raw_audio.frame_rate = fRate;
@@ -652,6 +655,7 @@ void JdMediaNode::_DiagCapture(int32 index, bigtime_t start, uint32 frames)
                                std::memory_order_relaxed);
         gDiag.capFirst = gDiag.capPrev = start;
         gDiag.capFrames.store(0, std::memory_order_relaxed);
+        gDiag.capSpanUs.store(0, std::memory_order_relaxed);
         gDiag.capBufs.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -668,6 +672,14 @@ void JdMediaNode::_DiagCapture(int32 index, bigtime_t start, uint32 frames)
     gDiag.capSpanUs.store(start - gDiag.capFirst, std::memory_order_relaxed);
     gDiag.capPrev = start;
     gDiag.capBufs.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* JACKDAW_DIAG: the measured input's connection ended or was remade, so its
+ * stamps start over; measure afresh from the next buffer to arrive. */
+void JdMediaNode::_DiagForgetCapture(int32 index)
+{
+    if (gDiag.capInput.load(std::memory_order_relaxed) == index)
+        gDiag.capInput.store(-1, std::memory_order_relaxed);
 }
 
 void JdMediaNode::ProducerDataStatus(const media_destination & /*dest*/, int32 /*status*/,
