@@ -29,7 +29,8 @@ CXXFLAGS = -std=c++17 $(COMMON) $(GLIB_CFLAGS)
 # the SDK include root and a build-mode define (fdebug.h insists on one).
 HOST_CXXFLAGS = $(CXXFLAGS) -I$(VST3_SDK) -DRELEASE=1
 # -ltracker: BFilePanel (open/save panels) lives in libtracker, not libbe.
-LDFLAGS  = -L$(NONPACKAGED)/lib -L$(VST3_LIB) -ljack -lbe -ltracker \
+# No -ljack: JACK support is the backends/jack.so add-on (see below).
+LDFLAGS  = -L$(NONPACKAGED)/lib -L$(VST3_LIB) -lbe -ltracker \
            -lsdk_hosting -lsdk_common -lbase -lpluginterfaces \
            $(LV2_LIBS) $(GLIB_LIBS) $(AUDIO_LIBS)
 
@@ -38,8 +39,7 @@ C_SOURCES   = src/engine/glib_check.c src/engine/message.c src/engine/settings.c
               src/engine/tempomap.c src/engine/timeruler.c \
               src/engine/audio_clip.c src/engine/clipregion.c src/engine/undo.c \
               src/engine/midiclip.c src/engine/render.c src/engine/midicontrol.c \
-              src/engine/rt_ringbuffer.c src/engine/audio_backend.c \
-              src/backend/jack/jack_backend.c
+              src/engine/rt_ringbuffer.c src/engine/audio_backend.c
 CXX_SOURCES = src/ui/main.cpp src/ui/JackDawApp.cpp src/ui/MainWindow.cpp \
               src/ui/TransportView.cpp src/ui/TimelineView.cpp src/ui/RulerView.cpp \
               src/ui/TrackAreaView.cpp src/ui/StepperControl.cpp \
@@ -65,6 +65,18 @@ VERSION_PARTS := $(subst ., ,$(VERSION))
 OBJECTS = $(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o) $(HOST_SOURCES:.cpp=.o) $(SDK_OBJECTS)
 DEPS    = $(OBJECTS:.o=.d)
 TARGET  = JackDAW
+
+# The JACK backend is an add-on that the engine loads at startup
+# (src/engine/audio_backend.c), so JackDAW itself never links libjack and runs
+# on a system without JACK. Plain C over libjack and the backend table.
+JACK_BACKEND = backends/jack.so
+
+all: $(TARGET) $(JACK_BACKEND)
+
+$(JACK_BACKEND): src/backend/jack/jack_backend.c src/engine/audio_backend.h
+	mkdir -p backends
+	$(CC) -std=gnu99 -Wall -Wextra -fPIC -shared -I$(NONPACKAGED)/include -Isrc $< -o $@ \
+		-L$(NONPACKAGED)/lib -ljack
 
 $(TARGET): $(OBJECTS) VERSION
 	$(CXX) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
@@ -108,6 +120,6 @@ src/host/sdk_memorystream.o: $(VST3_SDK)/public.sdk/source/common/memorystream.c
 -include $(DEPS)
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) $(TARGET)
+	rm -f $(OBJECTS) $(DEPS) $(TARGET) $(JACK_BACKEND)
 
-.PHONY: clean
+.PHONY: all clean

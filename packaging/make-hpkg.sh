@@ -21,8 +21,9 @@ make clean
 make
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/apps" "$STAGE/data/deskbar/menu/Applications"
+mkdir -p "$STAGE/apps" "$STAGE/data/deskbar/menu/Applications" "$STAGE/add-ons/JackDAW"
 cp JackDAW "$STAGE/apps/JackDAW"
+cp backends/jack.so "$STAGE/add-ons/JackDAW/jack.so"
 ln -sf ../../../../apps/JackDAW "$STAGE/data/deskbar/menu/Applications/JackDAW"
 
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@REVISION@/$REVISION/g" \

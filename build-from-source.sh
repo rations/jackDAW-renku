@@ -18,5 +18,8 @@ make
 
 mkdir -p /boot/system/non-packaged/apps
 cp JackDAW /boot/system/non-packaged/apps/JackDAW
+mkdir -p /boot/system/non-packaged/add-ons/JackDAW
+cp backends/jack.so /boot/system/non-packaged/add-ons/JackDAW/jack.so
 echo ">> Installed JackDAW to /boot/system/non-packaged/apps/JackDAW"
+echo ">> and its JACK support to /boot/system/non-packaged/add-ons/JackDAW/jack.so"
 echo ">> Start jackd, then launch JackDAW from Deskbar (Applications) or run ./JackDAW"
