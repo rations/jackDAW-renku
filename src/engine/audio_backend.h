@@ -66,7 +66,7 @@ typedef struct {
     void (*connections_changed)(void *arg);
 } JdBackendCallbacks;
 
-#define JD_BACKEND_ABI 1
+#define JD_BACKEND_ABI 2
 
 typedef struct JdBackend {
     uint32_t abi; /* JD_BACKEND_ABI */
@@ -112,6 +112,13 @@ typedef struct JdBackend {
     /* Start a worker thread with the backend's RT scheduling, joinable with
      * pthread_join. 0 = ok. */
     int (*create_rt_thread)(pthread_t *thread, void *(*fn)(void *), void *arg);
+
+    /* Optional, NULL if the backend has nothing to hold. While hold is
+     * nonzero, keep every input's capture latency as it is: a take is placed
+     * by the latency sampled when it was armed, so a change during the take
+     * would move the rest of it. A backend that would otherwise add margin
+     * after an input runs dry drops the late input instead. Non-RT. */
+    void (*hold_latency)(int hold);
 } JdBackend;
 
 /* Engine side: the backend named `which` ("jack", the default, or "mediakit").

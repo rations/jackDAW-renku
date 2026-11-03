@@ -268,6 +268,7 @@ static const JdBackend jb_backend = {
     jb_connect,
     jb_disconnect,
     jb_create_rt_thread,
+    NULL, /* hold_latency: JACK's port latency does not move */
 };
 
 const JdBackend *jackdaw_backend_entry(uint32_t abi)

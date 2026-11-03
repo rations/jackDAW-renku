@@ -2781,12 +2781,30 @@ static gboolean recorder_open_slot(guint i, JackDawTrack *t, off_t start_frame,
     t->rec_peak_count = 0;
     t->rec_peak_block = be ? (gint)be->buffer_size() : 1024;
 
-    /* Capture latency of the input port, for alignment compensation. */
+    /* Capture latency of the input port, for alignment compensation. The take
+     * is placed by this one figure, so hold the backend to it until the take
+     * is finalized (eng_release_latency_hold). */
+    if (be && be->hold_latency)
+        be->hold_latency(1);
     t->rec_latency = 0;
     if ((guint)t->audio_in_idx < engine.audio_in_count && engine.audio_in[(guint)t->audio_in_idx]) {
         t->rec_latency = (off_t)be->port_capture_latency(engine.audio_in[(guint)t->audio_in_idx]);
     }
     return TRUE;
+}
+
+/* Let the backend move input latency again once no take is open. Main thread.
+ * A slot's file is closed by the recorder thread; reading the pointer here
+ * races only with it going NULL, which at worst keeps the hold one call
+ * longer. */
+static void eng_release_latency_hold(void)
+{
+    if (!be || !be->hold_latency)
+        return;
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++)
+        if (recorder_slots[i].sf)
+            return;
+    be->hold_latency(0);
 }
 
 /* Arm every armed audio track for capture at the current play_pos. Main thread,
@@ -2828,6 +2846,7 @@ static void midi_arm_all(void)
 
 void jackdaw_engine_start_playback(void)
 {
+    eng_release_latency_hold(); /* a take that wrote nothing is never finalized */
     /* Punch in/out: when the record mode is punch and a tab region lies at or
      * ahead of the playhead, pre-open capture slots for every armed audio track.
      * The RT path engages recording as the playhead crosses loop_start and stops
@@ -2996,6 +3015,7 @@ void jackdaw_engine_finalize_takes(void)
         g_object_unref(rf->track);
         g_free(rf);
     }
+    eng_release_latency_hold();
 }
 
 /* Convert each armed instrument track's captured MIDI into clip notes. MAIN

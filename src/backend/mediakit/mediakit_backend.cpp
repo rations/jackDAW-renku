@@ -95,6 +95,9 @@ const int32 kFifoPeriods = 8; // FIFO capacity, in periods
 // only paid where it is needed.
 const int32 kPrimeHalvesFirst = 3;
 const int32 kPrimeHalvesMax = 4;
+// The capture latency reported for a take is the largest offset seen over
+// this long (see _FillInputs).
+const bigtime_t kLatencyWindowUs = 250000;
 
 const char *kClientPrefix = "jackdaw:";
 const char *kCapturePrefix = "media:";
@@ -121,6 +124,7 @@ struct Diag {
     std::atomic<int32> capGaps{0};      // stamp stepped > 1.5 buffers (this report)
     std::atomic<int32> capMaxStepUs{0}; // largest stamp step (this report)
     std::atomic<int32> capDry{0};       // input ran dry in a cycle (this report)
+    std::atomic<int32> capLatMin{INT32_MAX}, capLatMax{0}; // its offset, frames (this report)
     std::atomic<int64> capFrames{0};    // frames since the first stamp
     std::atomic<int64> capSpanUs{0};    // last stamp - first stamp
     std::atomic<int64> capCycles0{0};   // fCycles at the first stamp
@@ -178,8 +182,14 @@ struct Input {
     bool primed = false;
     int32 primeHalves = kPrimeHalvesFirst; // fill to start reading at
     bigtime_t lastEnd = 0;                 // performance time after the newest frame
+    uint64 owed = 0;                       // frames of cycles that ran dry, still to drop
+    int32 latCur = -1, latPrev = -1;       // largest offset, this and the last window
+    int32 latCycles = 0;                   // cycles into this window
     std::atomic<int32> latencyFrames{0};
 };
+
+// Set by the engine while a take is open (JdBackend::hold_latency).
+std::atomic<int32> gHoldLatency{0};
 
 bool format_is_convertible(uint32 f)
 {
@@ -577,6 +587,9 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
     in->primed = false;
     in->primeHalves = kPrimeHalvesFirst;
     in->lastEnd = 0;
+    in->owed = 0;
+    in->latCur = in->latPrev = -1;
+    in->latCycles = 0;
     in->latencyFrames.store(0);
     in->input.source = producer;
     in->input.format = format;
@@ -1007,16 +1020,41 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
         if (!in.connected)
             continue;
         uint64 avail = in.written - in.read;
+        // Frames of cycles that ran dry arrive late; drop them, so what
+        // follows plays (and records) where it belongs in time.
+        if (in.owed > 0) {
+            uint64 drop = in.owed < avail ? in.owed : avail;
+            in.read += drop;
+            in.owed -= drop;
+            avail -= drop;
+        }
         if (!in.primed && 2 * avail >= (uint64)fPeriod * in.primeHalves)
             in.primed = true;
         if (!in.primed || avail < (uint64)fPeriod) {
-            if (in.primed) { // ran dry: wait for it to refill, with more margin
-                in.primed = false;
-                if (in.primeHalves < kPrimeHalvesMax)
-                    in.primeHalves++;
+            if (in.primed) { // ran dry
                 if (gDiagOn)
                     gDiag.capDry.fetch_add(1, std::memory_order_relaxed);
                 notify_xrun();
+                if (gHoldLatency.load(std::memory_order_relaxed) != 0) {
+                    // A take is open: keep the latency it was placed by.
+                    // This cycle plays silence and its frames are dropped
+                    // when they come. An input that has stopped altogether
+                    // starts over once it is owed half the FIFO.
+                    in.owed += (uint64)fPeriod;
+                    if (in.owed > in.capFrames / 2) {
+                        in.primed = false;
+                        in.owed = 0;
+                        in.read = in.written;
+                        in.latCur = in.latPrev = -1;
+                    }
+                } else {
+                    // Wait for it to refill, with more margin. That moves
+                    // the latency, which nothing is holding now.
+                    in.primed = false;
+                    if (in.primeHalves < kPrimeHalvesMax)
+                        in.primeHalves++;
+                    in.latCur = in.latPrev = -1;
+                }
             }
             memset(in.scratch, 0, sizeof(float) * fPeriod * in.channels);
             continue;
@@ -1024,9 +1062,28 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
         // Capture-to-playback offset of the frames read now: they were
         // captured at lastEnd - avail, and play out with this cycle at
         // performanceTime. The engine shifts a recorded take back by this.
+        // A capture stamp can only be late (it comes from when the driver
+        // saw the buffer complete), which makes the offset look smaller, so
+        // the largest offset over the last window or two is the one
+        // reported.
         bigtime_t captured = in.lastEnd - (bigtime_t)(1000000.0 * (double)avail / fRate);
         double offset = (double)(performanceTime - captured) * fRate / 1000000.0;
-        in.latencyFrames.store(offset > 0 ? (int32)(offset + 0.5) : 0, std::memory_order_relaxed);
+        int32 frames = offset > 0 ? (int32)(offset + 0.5) : 0;
+        if (frames > in.latCur)
+            in.latCur = frames;
+        if (++in.latCycles * (bigtime_t)fPeriod * 1000000 >= kLatencyWindowUs * (bigtime_t)fRate) {
+            in.latPrev = in.latCur;
+            in.latCur = frames;
+            in.latCycles = 0;
+        }
+        in.latencyFrames.store(in.latCur > in.latPrev ? in.latCur : in.latPrev,
+                               std::memory_order_relaxed);
+        if (gDiagOn && i == gDiag.capInput.load(std::memory_order_relaxed)) {
+            if (frames < gDiag.capLatMin.load(std::memory_order_relaxed))
+                gDiag.capLatMin.store(frames, std::memory_order_relaxed);
+            if (frames > gDiag.capLatMax.load(std::memory_order_relaxed))
+                gDiag.capLatMax.store(frames, std::memory_order_relaxed);
+        }
 
         uint32 mask = in.capFrames - 1;
         for (int32 f = 0; f < fPeriod; f++) {
@@ -1378,10 +1435,13 @@ void print_diag()
     fprintf(stderr,
             "JackDAW capture in %d: buffers %d, stamp gaps %d (largest step %d us), ran dry %d; "
             "over %.1f s: stamps %+.1f ppm vs frames, cycle %+.1f ppm vs capture "
-            "(%+.0f frames)\n",
+            "(%+.0f frames); offset %d..%d frames, reported %d%s\n",
             (int)capIn, (int)gDiag.capBufs.exchange(0), (int)gDiag.capGaps.exchange(0),
             (int)gDiag.capMaxStepUs.exchange(0), (int)gDiag.capDry.exchange(0), span / 1e6,
-            stampPpm, cyclePpm, cycleFrames - frames);
+            stampPpm, cyclePpm, cycleFrames - frames,
+            (int)gDiag.capLatMin.exchange(INT32_MAX), (int)gDiag.capLatMax.exchange(0),
+            (int)gNode->fInputs[capIn].latencyFrames.load(std::memory_order_relaxed),
+            gHoldLatency.load(std::memory_order_relaxed) ? " (held)" : "");
 }
 
 // ---- the JdBackend table ----
@@ -1815,6 +1875,11 @@ int mk_create_rt_thread(pthread_t *thread, void *(*fn)(void *), void *arg)
     return 0;
 }
 
+void mk_hold_latency(int hold)
+{
+    gHoldLatency.store(hold ? 1 : 0, std::memory_order_relaxed);
+}
+
 const JdBackend kMediaKitBackend = {
     JD_BACKEND_ABI,
     "Media Kit",
@@ -1837,6 +1902,7 @@ const JdBackend kMediaKitBackend = {
     mk_connect,
     mk_disconnect,
     mk_create_rt_thread,
+    mk_hold_latency,
 };
 
 } // namespace
