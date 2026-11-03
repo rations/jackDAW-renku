@@ -68,6 +68,13 @@ typedef struct {
 
 #define JD_BACKEND_ABI 2
 
+/* A backend that changes its period while running (the buffer_size callback)
+ * goes no higher than its period at open or this, whichever is longer; the
+ * engine and plug-ins are sized for that up front. JACK can be set to any
+ * period, and a longer one than this reallocates the engine's buffers in the
+ * callback, as JACK allows. */
+#define JD_MAX_PERIOD 4096
+
 typedef struct JdBackend {
     uint32_t abi; /* JD_BACKEND_ABI */
     const char *name;

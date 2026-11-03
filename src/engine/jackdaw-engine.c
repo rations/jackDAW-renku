@@ -89,6 +89,10 @@ typedef struct {
     float slot_gain_L[JACKDAW_MAX_TRACKS];
     float slot_gain_R[JACKDAW_MAX_TRACKS];
     jd_nframes_t buf_size; /* current buffer size */
+    /* Frames the mix buffers above hold: at least JD_MAX_PERIOD, so a period
+     * change up to that (the Media Kit backend's, made on its cycle thread)
+     * only sets buf_size and never reallocates. */
+    jd_nframes_t buf_cap;
 
     /* Weak refs to active tracks — slots populated by engine_add_track */
     JackDawTrack *slots[JACKDAW_MAX_TRACKS];
@@ -1826,28 +1830,33 @@ static int engine_process(jd_nframes_t nframes, void *arg)
 }
 
 /* -----------------------------------------------------------------------
- * Buffer size callback — called by JACK when buffer size changes.
- * Must NOT block; reallocates mix buffers.
+ * Buffer size callback — the backend's period changed (never during a
+ * process call). The mix buffers hold buf_cap frames, at least JD_MAX_PERIOD,
+ * so a period up to that only takes effect here: the Media Kit backend calls
+ * this on its cycle thread, where nothing may be allocated. A longer period
+ * (JACK can be set to anything) reallocates; JACK runs this callback outside
+ * its process cycle, so that is allowed there.
  * ----------------------------------------------------------------------- */
 static int engine_buffer_size_cb(jd_nframes_t nframes, void *arg)
 {
     (void)arg;
 
-    /* Reallocate mix scratch buffers. Re-allocation is allowed here: the
-     * buffer-size callback runs outside the RT process cycle. */
-    g_free(engine.master_L);
-    g_free(engine.master_R);
-    g_free(engine.render_tap_L);
-    g_free(engine.render_tap_R);
-    engine.master_L = g_malloc0(nframes * sizeof(float));
-    engine.master_R = g_malloc0(nframes * sizeof(float));
-    engine.render_tap_L = g_malloc0(nframes * sizeof(float));
-    engine.render_tap_R = g_malloc0(nframes * sizeof(float));
-    for (guint s = 0; s < JACKDAW_MAX_TRACKS; s++) {
-        g_free(engine.slot_L[s]);
-        g_free(engine.slot_R[s]);
-        engine.slot_L[s] = g_malloc0(nframes * sizeof(float));
-        engine.slot_R[s] = g_malloc0(nframes * sizeof(float));
+    if (nframes > engine.buf_cap) {
+        g_free(engine.master_L);
+        g_free(engine.master_R);
+        g_free(engine.render_tap_L);
+        g_free(engine.render_tap_R);
+        engine.master_L = g_malloc0(nframes * sizeof(float));
+        engine.master_R = g_malloc0(nframes * sizeof(float));
+        engine.render_tap_L = g_malloc0(nframes * sizeof(float));
+        engine.render_tap_R = g_malloc0(nframes * sizeof(float));
+        for (guint s = 0; s < JACKDAW_MAX_TRACKS; s++) {
+            g_free(engine.slot_L[s]);
+            g_free(engine.slot_R[s]);
+            engine.slot_L[s] = g_malloc0(nframes * sizeof(float));
+            engine.slot_R[s] = g_malloc0(nframes * sizeof(float));
+        }
+        engine.buf_cap = nframes;
     }
     engine.buf_size = nframes;
 
@@ -1962,16 +1971,18 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         engine.click_buf[n] = (float)(0.5 * sin(2.0 * M_PI * 1000.0 * tt) * env);
     }
 
-    /* Allocate mix scratch buffers */
-    engine.master_L = g_malloc0(bs * sizeof(float));
-    engine.master_R = g_malloc0(bs * sizeof(float));
-    engine.render_tap_L = g_malloc0(bs * sizeof(float));
-    engine.render_tap_R = g_malloc0(bs * sizeof(float));
+    /* Allocate mix scratch buffers, for the longest period the backend may
+     * change to while running (engine_buffer_size_cb). */
+    engine.buf_cap = MAX(bs, (jd_nframes_t)JD_MAX_PERIOD);
+    engine.master_L = g_malloc0(engine.buf_cap * sizeof(float));
+    engine.master_R = g_malloc0(engine.buf_cap * sizeof(float));
+    engine.render_tap_L = g_malloc0(engine.buf_cap * sizeof(float));
+    engine.render_tap_R = g_malloc0(engine.buf_cap * sizeof(float));
     /* Per-slot scratch for parallel track processing (all slots, occupied or
      * not, so a worker can always write its slot). */
     for (guint s = 0; s < JACKDAW_MAX_TRACKS; s++) {
-        engine.slot_L[s] = g_malloc0(bs * sizeof(float));
-        engine.slot_R[s] = g_malloc0(bs * sizeof(float));
+        engine.slot_L[s] = g_malloc0(engine.buf_cap * sizeof(float));
+        engine.slot_R[s] = g_malloc0(engine.buf_cap * sizeof(float));
     }
 
     /* Register audio output ports: out_1 .. out_N. The array is sized to the
@@ -3319,6 +3330,12 @@ jd_nframes_t jackdaw_engine_get_buffer_size(void)
     if (!be)
         return 1024;
     return be->buffer_size();
+}
+
+jd_nframes_t jackdaw_engine_get_max_buffer_size(void)
+{
+    jd_nframes_t bs = jackdaw_engine_get_buffer_size();
+    return MAX(bs, (jd_nframes_t)JD_MAX_PERIOD);
 }
 
 off_t jackdaw_engine_get_play_pos(void)

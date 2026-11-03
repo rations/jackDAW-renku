@@ -28,9 +28,27 @@
  * Clock. The rate and period are those of the system mixer's output, which
  * are the hardware's (multi_audio only accepts its driver's own rate and
  * buffer length), and the node is slaved to the system time source. A
- * connection at another rate or buffer length is refused. Inputs from a
+ * connection at another rate or buffer length, or to a consumer on another
+ * time source, is refused. Inputs from a
  * second device run on that device's clock; their FIFO absorbs jitter and
  * drops or repeats data on drift, which is audible.
+ *
+ * Period changes (multi_audio's "Buffer size" setting, changed while
+ * running). Neither the system mixer nor multi_audio accepts ChangeFormat()
+ * from a producer, and the Media Kit sends no format-change notice, so:
+ *  - A hardware input that JackDAW feeds directly asks for its new length
+ *    itself (FormatChangeRequested); it is accepted when every other output
+ *    goes to that same device or to the system mixer.
+ *  - The system mixer, when its output changes, tells its producers of its
+ *    new latency (LatencyChanged). The roster watcher then reads the mixer's
+ *    output format, and the node follows its period when all its outputs go
+ *    to the mixer. The mixer takes input buffers of any length (it reads
+ *    each buffer's size_used), so it needs no notice.
+ * The engine's mix buffers, the port buffers and the input FIFOs are sized
+ * for the longest period up front (JD_MAX_PERIOD, or the period at open if
+ * longer), so a change allocates nothing but the new buffer groups, as a
+ * connection does. A change during a take moves the rest of the take: the
+ * device restarts its streams and the capture latency changes with it.
  *
  * Threads.
  *  - The node's control thread (BMediaEventLooper, B_URGENT_PRIORITY, the
@@ -48,7 +66,8 @@
  *
  * Allocation: buffers and FIFOs are allocated when a port is registered or a
  * connection is made (the Media Kit runs connection hooks on the control
- * thread, as for every node), never per cycle. Buffer requests do not wait. */
+ * thread, as for every node), and buffer groups also when the period
+ * changes; never per cycle. Buffer requests do not wait. */
 #include <Autolock.h>
 #include <Buffer.h>
 #include <BufferConsumer.h>
@@ -103,7 +122,23 @@ const char *kClientPrefix = "jackdaw:";
 const char *kCapturePrefix = "media:";
 
 enum { SEND_CYCLE_EVENT = BTimedEventQueue::B_USER_EVENT + 1 };
-enum { MSG_DIAG_REPORT = 'jdmd' };
+enum {
+    MSG_DIAG_REPORT = 'jdmd',
+    MSG_CHECK_PERIOD = 'jdck',   // watcher: read the system mixer's period
+    MSG_PERIOD_CHANGED = 'jdpc', // watcher: report a period change
+};
+// Written to the node's control port by the roster watcher; handled in
+// JdMediaNode::HandleMessage. Media Kit codes are 0x100-0x7ff
+// (ServerInterface.h), so a four-letter code cannot collide with them.
+const int32 kFollowMixerCode = 'jdfm';
+struct FollowMixer {
+    float rate;
+    int32 period;
+    port_id mixerPort; // the mixer's control port: its inputs' destinations
+};
+// The control thread asks the watcher for a check at most once at a time.
+std::atomic<int32> gCheckQueued{0};
+const int32 kMinPeriod = 16;
 
 /* JACKDAW_DIAG counters: written by the control thread with relaxed atomics
  * (no lock, no allocation), read and printed every 2 s by the roster
@@ -145,7 +180,7 @@ struct Port {
     int direction = JD_PORT_INPUT;
     char shortName[64] = "";
     char fullName[80] = "";
-    float *audio = NULL;     // period frames, kept until close
+    float *audio = NULL;     // MaxPeriod() frames, kept until close
     MidiBuffer *midi = NULL; // kept until close
     // Inputs: (generation << 16) | (input << 8) | channel, or -1.
     std::atomic<int32> route{-1};
@@ -157,6 +192,8 @@ struct OutConn {
     bool enabled = true;
     media_output output;
     BBufferGroup *group = NULL;
+    bool ownGroup = false; // group is ours (not the consumer's)
+    bigtime_t groupLead = 0; // how far ahead of play our group has buffers for
     bigtime_t latency = 0; // downstream
 };
 
@@ -178,7 +215,7 @@ struct Input {
     float *fifo = NULL;           // interleaved float, capFrames frames
     uint32 capFrames = 0;         // power of two
     uint64 written = 0, read = 0; // frames; control thread only
-    float *scratch = NULL;        // this cycle, planar: channels x period
+    float *scratch = NULL;        // this cycle, planar: channels x period (max period long)
     bool primed = false;
     int32 primeHalves = kPrimeHalvesFirst; // fill to start reading at
     bigtime_t lastEnd = 0;                 // performance time after the newest frame
@@ -318,9 +355,15 @@ public:
     {
         return fRate;
     }
+    // Any thread. The control thread uses fPeriod.
     int32 Period() const
     {
-        return fPeriod;
+        return fPeriodShared.load(std::memory_order_relaxed);
+    }
+    // The longest period this node can change to; port buffers hold this.
+    int32 MaxPeriod() const
+    {
+        return fMaxPeriod;
     }
     bigtime_t CurrentEventLatency() const
     {
@@ -331,6 +374,10 @@ public:
     Input fInputs[kMaxInputs];
     BLocker fInputLock; // the main window's view of fInputs
     std::atomic<int32> fCycles{0};
+    // Set by mk_open before the node starts, so before any hook that uses
+    // them; a BMessenger to a looper that has quit just fails to send.
+    BMessenger fWatcher;
+    std::atomic<port_id> fMixerPort{-1}; // the system mixer's control port
 
 protected:
     void NodeRegistered() override;
@@ -346,9 +393,16 @@ private:
     void _DiagCapture(int32 index, bigtime_t start, uint32 frames);
     void _DiagForgetCapture(int32 index);
     void _SendOutputs(bigtime_t performanceTime);
+    void _QueuePeriodCheck();
+    void _FollowMixer(const FollowMixer &m);
+    status_t _ChangePeriod(int32 period);
+    bool _OthersTakeLength(const OutConn *except, port_id consumerPort) const;
+    status_t _MakeOwnGroup(OutConn &o);
 
     float fRate;
-    int32 fPeriod;
+    int32 fPeriod; // control thread
+    std::atomic<int32> fPeriodShared;
+    const int32 fMaxPeriod;
     bigtime_t fInternalLatency;
     bigtime_t fStartTime = 0;
     uint64 fFramesSent = 0;
@@ -369,6 +423,7 @@ void notify_xrun()
 }
 
 void print_diag();
+void check_mixer_period();
 
 void RosterWatcher::MessageReceived(BMessage *message)
 {
@@ -390,6 +445,24 @@ void RosterWatcher::MessageReceived(BMessage *message)
         case MSG_DIAG_REPORT:
             print_diag();
             break;
+        case MSG_CHECK_PERIOD:
+            check_mixer_period();
+            break;
+        case MSG_PERIOD_CHANGED: {
+            int32 period = message->GetInt32("period", 0);
+            int32 old = message->GetInt32("old", 0);
+            float rate = gNode ? gNode->Rate() : 0.0f;
+            if (message->GetBool("refused", false))
+                fprintf(stderr,
+                        "JackDAW media: a period of %d frames is outside %d..%d; staying at %d\n",
+                        (int)period, (int)kMinPeriod, gNode ? (int)gNode->MaxPeriod() : 0,
+                        (int)old);
+            else
+                fprintf(stderr, "JackDAW media: period %d -> %d frames (%.2f ms)%s\n", (int)old,
+                        (int)period, rate > 0 ? 1000.0 * period / rate : 0.0,
+                        message->GetInt32("noGroup", 0) ? "; an output had no buffers left" : "");
+            break;
+        }
         default:
             BLooper::MessageReceived(message);
             break;
@@ -400,7 +473,8 @@ void RosterWatcher::MessageReceived(BMessage *message)
 
 JdMediaNode::JdMediaNode(float rate, int32 period)
     : BMediaNode("JackDAW"), BBufferConsumer(B_MEDIA_RAW_AUDIO), BBufferProducer(B_MEDIA_RAW_AUDIO),
-      BMediaEventLooper(), fInputLock("JackDAW inputs"), fRate(rate), fPeriod(period)
+      BMediaEventLooper(), fInputLock("JackDAW inputs"), fRate(rate), fPeriod(period),
+      fPeriodShared(period), fMaxPeriod(period > JD_MAX_PERIOD ? period : JD_MAX_PERIOD)
 {
     fInternalLatency = (bigtime_t)(1000000.0 * period / rate);
     for (int32 j = 0; j < kMaxJacks; j++) {
@@ -437,10 +511,14 @@ BMediaAddOn *JdMediaNode::AddOn(int32 *internalID) const
     return NULL; // an application node, not from an add-on
 }
 
-status_t JdMediaNode::HandleMessage(int32 /*message*/, const void * /*data*/, size_t /*size*/)
+status_t JdMediaNode::HandleMessage(int32 message, const void *data, size_t size)
 {
-    // The event looper's base classes handle every Media Kit message; like
-    // the system mixer we have none of our own.
+    // The event looper's base classes handle every Media Kit message; the
+    // only one of our own is the watcher's report of the mixer's period.
+    if (message == kFollowMixerCode && size == sizeof(FollowMixer)) {
+        _FollowMixer(*(const FollowMixer *)data);
+        return B_OK;
+    }
     return B_ERROR;
 }
 
@@ -497,6 +575,18 @@ void JdMediaNode::_UpdateLatency()
             if (fJacks[j].conns[c].connected && fJacks[j].conns[c].latency > downstream)
                 downstream = fJacks[j].conns[c].latency;
     SetEventLatency(downstream + fInternalLatency);
+    // Every output is sent this far ahead of play, so each holds that much
+    // in buffers at its consumer: a direct hardware input with little
+    // latency of its own still waits for the slowest path (the mixer's).
+    // Re-make a group of ours that no longer covers it, before it runs dry.
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            OutConn &o = fJacks[j].conns[c];
+            if (o.connected && o.ownGroup && EventLatency() > o.groupLead + BufferDuration() &&
+                _MakeOwnGroup(o) != B_OK)
+                o.connected = false; // nothing to send from; it stays reserved
+        }
+    }
 }
 
 // ---- consumer side ----
@@ -567,9 +657,10 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
     if (ch < 1 || ch > kMaxInChannels)
         return B_MEDIA_BAD_FORMAT;
 
-    uint32 cap = next_pow2((uint32)fPeriod * kFifoPeriods);
+    // Sized for the longest period, so a period change needs neither.
+    uint32 cap = next_pow2((uint32)fMaxPeriod * kFifoPeriods);
     float *fifo = (float *)calloc((size_t)cap * ch, sizeof(float));
-    float *scratch = (float *)calloc((size_t)fPeriod * ch, sizeof(float));
+    float *scratch = (float *)calloc((size_t)fMaxPeriod * ch, sizeof(float));
     if (!fifo || !scratch) {
         free(fifo);
         free(scratch);
@@ -726,8 +817,14 @@ status_t JdMediaNode::FormatChanged(const media_source &producer, const media_de
         a.format != now.format || a.byte_order != now.byte_order || frameBytes == 0 ||
         a.buffer_size / frameBytes > in->capFrames / 2)
         return B_MEDIA_BAD_FORMAT;
-    BAutolock lock(fInputLock);
-    in->input.format = format;
+    bool newLength = a.buffer_size != now.buffer_size;
+    {
+        BAutolock lock(fInputLock);
+        in->input.format = format;
+    }
+    // The device's buffer length changed, so the mixer's may have too.
+    if (newLength)
+        _QueuePeriodCheck();
     return B_OK;
 }
 
@@ -769,11 +866,65 @@ status_t JdMediaNode::FormatProposal(const media_source &output, media_format *f
     return B_OK;
 }
 
-status_t JdMediaNode::FormatChangeRequested(const media_source & /*source*/,
-                                            const media_destination & /*dest*/,
-                                            media_format * /*format*/, int32 * /*deprecated*/)
+/* A consumer asks for another format: multi_audio does, for its new buffer
+ * length, when JackDAW feeds a hardware input directly. Only the length may
+ * change, and it becomes the period of the whole node, so it is refused when
+ * another output goes to a consumer that would still want the old one. */
+status_t JdMediaNode::FormatChangeRequested(const media_source &source,
+                                            const media_destination &dest,
+                                            media_format *format, int32 * /*deprecated*/)
 {
-    return B_ERROR;
+    int32 j;
+    OutConn *o = _FindOutput(source, &j);
+    if (!o || !o->connected || o->output.destination != dest)
+        return B_MEDIA_BAD_SOURCE;
+    if (format->type == B_MEDIA_UNKNOWN_TYPE)
+        format->type = B_MEDIA_RAW_AUDIO;
+    if (format->type != B_MEDIA_RAW_AUDIO)
+        return B_MEDIA_BAD_FORMAT;
+    media_raw_audio_format &a = format->u.raw_audio;
+    const media_raw_audio_format &now = o->output.format.u.raw_audio;
+    const media_raw_audio_format &w = media_raw_audio_format::wildcard;
+    if (a.frame_rate == w.frame_rate)
+        a.frame_rate = now.frame_rate;
+    if (a.channel_count == w.channel_count)
+        a.channel_count = now.channel_count;
+    if (a.format == w.format)
+        a.format = now.format;
+    if (a.byte_order == w.byte_order)
+        a.byte_order = now.byte_order;
+    if (a.buffer_size == w.buffer_size)
+        a.buffer_size = now.buffer_size;
+    size_t frame = sample_size(a.format) * a.channel_count;
+    if (fabsf(a.frame_rate - fRate) > 0.5f || a.channel_count != now.channel_count ||
+        a.format != now.format || a.byte_order != now.byte_order || frame == 0 ||
+        a.buffer_size % frame != 0)
+        return B_MEDIA_BAD_FORMAT;
+    int32 period = (int32)(a.buffer_size / frame);
+    if (period == fPeriod)
+        return B_OK;
+
+    if (!_OthersTakeLength(o, dest.port))
+        return B_MEDIA_BAD_FORMAT;
+    return _ChangePeriod(period);
+}
+
+/* Whether every output but `except` could take a new period: it goes to the
+ * system mixer (any length) or to `consumerPort`, the node asking for it. */
+bool JdMediaNode::_OthersTakeLength(const OutConn *except, port_id consumerPort) const
+{
+    port_id mixer = fMixerPort.load(std::memory_order_relaxed);
+    for (int32 k = 0; k < kMaxJacks; k++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            const OutConn &other = fJacks[k].conns[c];
+            if (!other.reserved || &other == except)
+                continue;
+            port_id port = other.output.destination.port;
+            if (port != consumerPort && port != mixer)
+                return false;
+        }
+    }
+    return true;
 }
 
 status_t JdMediaNode::GetNextOutput(int32 *cookie, media_output *output)
@@ -825,17 +976,34 @@ status_t JdMediaNode::SetBufferGroup(const media_source &source, BBufferGroup *g
     // is a no-op.
     if (group != NULL && group == o->group)
         return B_OK;
-    delete o->group; // waits for its buffers to come back
+    delete o->group;
     o->group = group;
-    if (!o->group) {
-        int32 count = (int32)(o->latency / BufferDuration()) + 3;
-        o->group = new (std::nothrow) BBufferGroup(o->output.format.u.raw_audio.buffer_size, count);
-        if (!o->group || o->group->InitCheck() != B_OK) {
-            delete o->group;
-            o->group = NULL;
-            return B_NO_MEMORY;
-        }
+    o->ownGroup = false;
+    if (!o->group)
+        return _MakeOwnGroup(*o);
+    return B_OK;
+}
+
+/* A group of our own for o's buffers: enough for every buffer between being
+ * sent, the node's event latency (or o's own path, if that is longer and not
+ * counted in yet) ahead of play, and coming back. */
+status_t JdMediaNode::_MakeOwnGroup(OutConn &o)
+{
+    delete o.group;
+    o.group = NULL;
+    o.ownGroup = false;
+    bigtime_t lead = o.latency + fInternalLatency;
+    if (EventLatency() > lead)
+        lead = EventLatency();
+    o.groupLead = lead;
+    int32 count = (int32)((lead + BufferDuration() - 1) / BufferDuration()) + 3;
+    o.group = new (std::nothrow) BBufferGroup(o.output.format.u.raw_audio.buffer_size, count);
+    if (!o.group || o.group->InitCheck() != B_OK) {
+        delete o.group;
+        o.group = NULL;
+        return B_NO_MEMORY;
     }
+    o.ownGroup = true;
     return B_OK;
 }
 
@@ -867,15 +1035,27 @@ status_t JdMediaNode::PrepareToConnect(const media_source &what, const media_des
         a.format = media_raw_audio_format::B_AUDIO_FLOAT;
     if (a.byte_order == w.byte_order)
         a.byte_order = B_MEDIA_HOST_ENDIAN;
-    size_t want = (size_t)fPeriod * a.channel_count * sample_size(a.format);
+    size_t frame = (size_t)a.channel_count * sample_size(a.format);
+    size_t want = (size_t)fPeriod * frame;
     if (a.buffer_size == w.buffer_size)
         a.buffer_size = want;
     // Our clock is the hardware's: refuse another rate or buffer length rather
     // than resample.
     if (fabsf(a.frame_rate - fRate) > 0.5f || a.channel_count != (uint32)fJacks[j].channels ||
-        !format_is_convertible(a.format) || a.byte_order != B_MEDIA_HOST_ENDIAN ||
+        !format_is_convertible(a.format) || a.byte_order != B_MEDIA_HOST_ENDIAN || frame == 0 ||
         a.buffer_size != want)
         return B_MEDIA_BAD_FORMAT;
+    // Buffers are stamped in our time source's performance time, and a
+    // consumer plays them by its own. One on another clock (a second sound
+    // card, while the system mixer and its time source are on the first)
+    // drifts from ours; in testing, a UMC204HD that was not the default
+    // output also never gave our buffers back, so the output ran out of
+    // them at once. Two clocks would need resampling; refuse instead.
+    bigtime_t consumerLatency;
+    media_node_id consumerClock;
+    if (FindLatencyFor(where, &consumerLatency, &consumerClock) != B_OK ||
+        consumerClock != TimeSource()->ID())
+        return B_MEDIA_BAD_DESTINATION;
 
     o->reserved = true;
     o->output.destination = where;
@@ -922,8 +1102,11 @@ void JdMediaNode::Disconnect(const media_source &what, const media_destination &
     o->output.destination = media_destination::null;
     delete o->group;
     o->group = NULL;
+    o->ownGroup = false;
     o->latency = 0;
     _UpdateLatency();
+    // That may have been what held the period off the mixer's.
+    _QueuePeriodCheck();
 }
 
 void JdMediaNode::LateNoticeReceived(const media_source &what, bigtime_t howMuch,
@@ -959,6 +1142,110 @@ void JdMediaNode::LatencyChanged(const media_source &source, const media_destina
         return;
     o->latency = newLatency;
     _UpdateLatency();
+    // The system mixer sends this when its output format changes, which is
+    // the only notice there is of a new hardware buffer length.
+    _QueuePeriodCheck();
+}
+
+/* Ask the roster watcher to read the system mixer's period (it may not query
+ * the mixer from here: the mixer could be waiting on us). One at a time. */
+void JdMediaNode::_QueuePeriodCheck()
+{
+    if (gCheckQueued.exchange(1, std::memory_order_acq_rel) != 0)
+        return;
+    BMessage check(MSG_CHECK_PERIOD);
+    if (fWatcher.SendMessage(&check, (BHandler *)NULL, 0) != B_OK)
+        gCheckQueued.store(0, std::memory_order_release);
+}
+
+/* The watcher's reading of the system mixer's output. Follow its period when
+ * every output goes to the mixer; a hardware input connected directly asks
+ * for its own length instead (FormatChangeRequested). */
+void JdMediaNode::_FollowMixer(const FollowMixer &m)
+{
+    fMixerPort.store(m.mixerPort, std::memory_order_relaxed);
+    if (m.period == fPeriod || fabsf(m.rate - fRate) > 0.5f)
+        return; // a new rate needs a restart of JackDAW
+    for (int32 j = 0; j < kMaxJacks; j++)
+        for (int32 c = 0; c < kMaxOutConns; c++)
+            if (fJacks[j].conns[c].connected &&
+                fJacks[j].conns[c].output.destination.port != m.mixerPort)
+                return;
+    _ChangePeriod(m.period);
+}
+
+/* Run at `period` frames from the next cycle on. Control thread, between
+ * cycles. */
+status_t JdMediaNode::_ChangePeriod(int32 period)
+{
+    int32 old = fPeriod;
+    if (period == old)
+        return B_OK;
+    if (period < kMinPeriod || period > fMaxPeriod) {
+        BMessage note(MSG_PERIOD_CHANGED);
+        note.AddInt32("period", period);
+        note.AddInt32("old", old);
+        note.AddBool("refused", true);
+        fWatcher.SendMessage(&note, (BHandler *)NULL, 0);
+        return B_MEDIA_BAD_FORMAT;
+    }
+
+    // The engine's buffers already hold the longest period, so this only
+    // sets its cycle length.
+    if (gCb.buffer_size)
+        gCb.buffer_size((jd_nframes_t)period, gArg);
+    fPeriod = period;
+    fPeriodShared.store(period, std::memory_order_relaxed);
+    bigtime_t duration = (bigtime_t)(1000000.0 * period / fRate);
+    SetBufferDuration(duration);
+    fInternalLatency = duration; // late notices start over
+
+    int32 noGroup = 0;
+    for (int32 j = 0; j < kMaxJacks; j++) {
+        for (int32 c = 0; c < kMaxOutConns; c++) {
+            OutConn &o = fJacks[j].conns[c];
+            if (!o.reserved)
+                continue;
+            media_raw_audio_format &a = o.output.format.u.raw_audio;
+            a.buffer_size = (size_t)period * a.channel_count * sample_size(a.format);
+            if (!o.connected)
+                continue;
+            media_node_id ts;
+            if (FindLatencyFor(o.output.destination, &o.latency, &ts) != B_OK)
+                o.latency = 0;
+            // Our groups hold buffers of the old length and count: make them
+            // again in _UpdateLatency. A consumer's own group stays: a buffer
+            // of at least the new length is all a request needs.
+            if (o.ownGroup)
+                o.groupLead = -BufferDuration() - 1;
+        }
+    }
+    _UpdateLatency();
+    for (int32 j = 0; j < kMaxJacks; j++)
+        for (int32 c = 0; c < kMaxOutConns; c++)
+            if (fJacks[j].conns[c].reserved && !fJacks[j].conns[c].connected)
+                noGroup++;
+
+    // The device restarted its streams: read every input afresh.
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        Input &in = fInputs[i];
+        if (!in.connected)
+            continue;
+        in.read = in.written;
+        in.primed = false;
+        in.primeHalves = kPrimeHalvesFirst;
+        in.owed = 0;
+        in.latCur = in.latPrev = -1;
+        in.latCycles = 0;
+        _DiagForgetCapture(i);
+    }
+
+    BMessage note(MSG_PERIOD_CHANGED);
+    note.AddInt32("period", period);
+    note.AddInt32("old", old);
+    note.AddInt32("noGroup", noGroup);
+    fWatcher.SendMessage(&note, (BHandler *)NULL, 0);
+    return B_OK;
 }
 
 // ---- the cycle ----
@@ -1028,8 +1315,19 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
             in.owed -= drop;
             avail -= drop;
         }
-        if (!in.primed && 2 * avail >= (uint64)fPeriod * in.primeHalves)
+        if (!in.primed && 2 * avail >= (uint64)fPeriod * in.primeHalves) {
+            // Start reading at exactly the wait, dropping anything older: a
+            // backlog would stay in the FIFO as extra latency for good. One
+            // builds up when cycles pause while capture goes on, as they do
+            // for a moment after the period shrinks (the next cycle waits
+            // for the shorter lead).
+            uint64 target = ((uint64)fPeriod * in.primeHalves + 1) / 2;
+            if (avail > target) {
+                in.read = in.written - target;
+                avail = target;
+            }
             in.primed = true;
+        }
         if (!in.primed || avail < (uint64)fPeriod) {
             if (in.primed) { // ran dry
                 if (gDiagOn)
@@ -1306,11 +1604,14 @@ Port *port_by_full_name(const char *name)
 
 /* The format of the system mixer's (first) output: the hardware's rate and
  * buffer length. */
-bool mixer_output_format(BMediaRoster *roster, float *rate, int32 *period)
+bool mixer_output_format(BMediaRoster *roster, float *rate, int32 *period,
+                         port_id *mixerPort = NULL)
 {
     media_node mixer;
     if (roster->GetAudioMixer(&mixer) != B_OK)
         return false;
+    if (mixerPort)
+        *mixerPort = mixer.port;
     media_output out;
     int32 n = 0;
     bool ok = roster->GetConnectedOutputsFor(mixer, &out, 1, &n) == B_OK && n == 1;
@@ -1399,6 +1700,24 @@ status_t connect_jack(BMediaRoster *roster, int32 jack, const media_node &consum
     media_output madeOut;
     media_input madeIn;
     return roster->Connect(free->source, in.destination, &fmt, &madeOut, &madeIn);
+}
+
+/* The system mixer's output may have a new buffer length: tell the node,
+ * which decides on its own thread whether to follow it. Runs on the watcher
+ * (which mk_close stops before the node goes away). */
+void check_mixer_period()
+{
+    gCheckQueued.store(0, std::memory_order_release);
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!gNode || !roster)
+        return;
+    FollowMixer m;
+    if (!mixer_output_format(roster, &m.rate, &m.period, &m.mixerPort))
+        return;
+    if (m.period == gNode->Period())
+        return;
+    write_port_etc(gNode->ControlPort(), kFollowMixerCode, &m, sizeof m, B_RELATIVE_TIMEOUT,
+                   500000);
 }
 
 /* JACKDAW_DIAG: what the node did in the last 2 s. Runs on the watcher. */
@@ -1505,6 +1824,7 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
     gWatcher = new (std::nothrow) RosterWatcher();
     if (gWatcher) {
         gWatcher->Run();
+        gNode->fWatcher = BMessenger(gWatcher);
         roster->StartWatching(BMessenger(gWatcher));
         // The server's own quit notice only goes to watchers that ask for it
         // by name (BMediaRoster::StartWatching, MediaRoster.cpp).
@@ -1529,6 +1849,7 @@ int mk_activate(void)
     // Master and Metronome go to the system mixer, as JACK's playback_1/2.
     media_node mixer;
     if (roster->GetAudioMixer(&mixer) == B_OK) {
+        gNode->fMixerPort.store(mixer.port, std::memory_order_relaxed);
         status_t e1 = connect_jack(roster, 0, mixer);
         status_t e2 = connect_jack(roster, kMetronomeJack, mixer);
         if (e1 != B_OK || e2 != B_OK)
@@ -1619,7 +1940,7 @@ JdPort *mk_port_register(const char *shortName, int type, int direction)
             port.midi->count = 0;
         } else {
             if (!port.audio)
-                port.audio = (float *)calloc((size_t)gNode->Period(), sizeof(float));
+                port.audio = (float *)calloc((size_t)gNode->MaxPeriod(), sizeof(float));
             if (!port.audio)
                 return NULL;
         }

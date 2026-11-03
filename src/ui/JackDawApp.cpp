@@ -22,10 +22,11 @@ void JackDawApp::ReadyToRun()
     m_main_window = new MainWindow(m_project);
     if (jackdaw_engine_init(m_project))
         g_warning("JACK engine failed to start — running without audio");
-    // Plugin host: RT process buffers are pre-allocated to the JACK block
-    // size, so this must come after the engine knows it.
+    // Plugin host: RT process buffers are pre-allocated to the longest block
+    // the engine can run (the period may change while running), so this must
+    // come after the engine knows its period.
     pluginhost_init((double)jackdaw_engine_get_sample_rate(),
-                    (int)jackdaw_engine_get_buffer_size());
+                    (int)jackdaw_engine_get_max_buffer_size());
     RunStartupScan();
     m_main_window->Show();
 }

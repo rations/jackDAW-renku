@@ -190,6 +190,10 @@ gboolean jackdaw_engine_is_counting_in(void);
 /* Sample rate reported by JACK (valid after jackdaw_engine_init) */
 jd_nframes_t jackdaw_engine_get_sample_rate(void);
 jd_nframes_t jackdaw_engine_get_buffer_size(void);
+/* The longest period the engine is ready for without reallocating: the
+ * current one or JD_MAX_PERIOD, whichever is longer. Plug-ins are set up for
+ * blocks of this length, so a later period change still runs them. */
+jd_nframes_t jackdaw_engine_get_max_buffer_size(void);
 
 /* Monotonically-increasing playback position in samples.
  * Reset by jackdaw_engine_locate(); increments nframes per process cycle
