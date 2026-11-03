@@ -91,7 +91,14 @@
  * Allocation: buffers and FIFOs are allocated when a port is registered or a
  * connection is made (the Media Kit runs connection hooks on the control
  * thread, as for every node), and buffer groups also when the period
- * changes; never per cycle. Buffer requests do not wait. */
+ * changes; never per cycle. Buffer requests do not wait.
+ *
+ * Other hosts. Nothing here is JackDAW's engine, so another program can build
+ * this file in and drive it through the same table (VST3-renku's vst3host
+ * does). jackdaw_mediakit_set_node_name renames the node and its MIDI
+ * endpoints, open's client name sets the ports' full-name prefix, and the
+ * Metronome jack is connected to the mixer only if a "metronome" port is
+ * registered before activate. */
 #include <Autolock.h>
 #include <Buffer.h>
 #include <BufferConsumer.h>
@@ -146,8 +153,13 @@ const int32 kPrimeHalvesMax = 4;
 // this long (see _FillInputs).
 const bigtime_t kLatencyWindowUs = 250000;
 
-const char *kClientPrefix = "jackdaw:";
 const char *kCapturePrefix = "media:";
+
+// The node's name (Cortex, MIDI endpoint names, thread names, log lines) and
+// the prefix of our ports' full names ("<client name>:"). Written only by
+// jackdaw_mediakit_set_node_name and mk_open while no node exists, read after.
+char gNodeName[B_MEDIA_NAME_LENGTH] = "JackDAW";
+char gClientPrefix[64] = "jackdaw:";
 
 enum { SEND_CYCLE_EVENT = BTimedEventQueue::B_USER_EVENT + 1 };
 enum {
@@ -373,7 +385,7 @@ class JdMediaNode;
 class RosterWatcher : public BLooper
 {
 public:
-    RosterWatcher() : BLooper("JackDAW media watcher")
+    RosterWatcher() : BLooper("media watcher")
     {
     }
     ~RosterWatcher() override
@@ -554,12 +566,12 @@ void RosterWatcher::MessageReceived(BMessage *message)
             float rate = gNode ? gNode->Rate() : 0.0f;
             if (message->GetBool("refused", false))
                 fprintf(stderr,
-                        "JackDAW media: a period of %d frames is outside %d..%d; staying at %d\n",
-                        (int)period, (int)kMinPeriod, gNode ? (int)gNode->MaxPeriod() : 0,
-                        (int)old);
+                        "%s media: a period of %d frames is outside %d..%d; staying at %d\n",
+                        gNodeName, (int)period, (int)kMinPeriod,
+                        gNode ? (int)gNode->MaxPeriod() : 0, (int)old);
             else
-                fprintf(stderr, "JackDAW media: period %d -> %d frames (%.2f ms)%s\n", (int)old,
-                        (int)period, rate > 0 ? 1000.0 * period / rate : 0.0,
+                fprintf(stderr, "%s media: period %d -> %d frames (%.2f ms)%s\n", gNodeName,
+                        (int)old, (int)period, rate > 0 ? 1000.0 * period / rate : 0.0,
                         message->GetInt32("noGroup", 0) ? "; an output had no buffers left" : "");
             break;
         }
@@ -572,8 +584,8 @@ void RosterWatcher::MessageReceived(BMessage *message)
 // ---- JdMediaNode ----
 
 JdMediaNode::JdMediaNode(float rate, int32 period)
-    : BMediaNode("JackDAW"), BBufferConsumer(B_MEDIA_RAW_AUDIO), BBufferProducer(B_MEDIA_RAW_AUDIO),
-      BMediaEventLooper(), fInputLock("JackDAW inputs"), fRate(rate), fPeriod(period),
+    : BMediaNode(gNodeName), BBufferConsumer(B_MEDIA_RAW_AUDIO), BBufferProducer(B_MEDIA_RAW_AUDIO),
+      BMediaEventLooper(), fInputLock("media node inputs"), fRate(rate), fPeriod(period),
       fPeriodShared(period), fMaxPeriod(period > JD_MAX_PERIOD ? period : JD_MAX_PERIOD)
 {
     fInternalLatency = (bigtime_t)(1000000.0 * period / rate);
@@ -1765,8 +1777,8 @@ void list_capture_sources(std::vector<CaptureSource> &out)
             continue;
         for (int32 c = 0; c < in.channels; c++) {
             CaptureSource s;
-            snprintf(s.name, sizeof s.name, "%sJackDAW %s / %d", kCapturePrefix, in.input.name,
-                     (int)(c + 1));
+            snprintf(s.name, sizeof s.name, "%s%s %s / %d", kCapturePrefix, gNodeName,
+                     in.input.name, (int)(c + 1));
             s.channel = c;
             s.input = i;
             out.push_back(s);
@@ -1860,7 +1872,7 @@ void release_dead_capture_connections(BMediaRoster *roster)
             // the result says nothing; the producer side is what frees it.
             roster->Disconnect(nodes[n].node.node, outs[o].source, nodes[n].node.node,
                                outs[o].destination);
-            fprintf(stderr, "JackDAW media: released %s / %s from a consumer that is gone\n",
+            fprintf(stderr, "%s media: released %s / %s from a consumer that is gone\n", gNodeName,
                     nodes[n].name, outs[o].name);
         }
     }
@@ -1919,10 +1931,10 @@ void print_diag()
         return;
     int32 lead = gDiag.minLeadUs.exchange(INT32_MAX, std::memory_order_relaxed);
     fprintf(stderr,
-            "JackDAW media: cycles %d, sent %d, send failed %d, no buffer %d, late notices %d "
+            "%s media: cycles %d, sent %d, send failed %d, no buffer %d, late notices %d "
             "(max %d us), late wakes %d, master peak %.3f, least lead %d us, event latency "
             "%lld us\n",
-            (int)gNode->fCycles.load(), (int)gDiag.sent.exchange(0),
+            gNodeName, (int)gNode->fCycles.load(), (int)gDiag.sent.exchange(0),
             (int)gDiag.sendFail.exchange(0), (int)gDiag.noBuffer.exchange(0),
             (int)gDiag.lateNotes.exchange(0), (int)gDiag.lateUs.exchange(0),
             (int)gDiag.lateWake.exchange(0), gDiag.peakMilli.exchange(0) / 1000.0,
@@ -1944,13 +1956,13 @@ void print_diag()
     double stampPpm = span > 0 ? (span - frames * 1e6 / rate) / span * 1e6 : 0;
     double cyclePpm = frames > 0 ? (cycleFrames - frames) / frames * 1e6 : 0;
     fprintf(stderr,
-            "JackDAW capture in %d: buffers %d, stamp gaps %d (largest step %d us), ran dry %d; "
+            "%s capture in %d: buffers %d, stamp gaps %d (largest step %d us), ran dry %d; "
             "over %.1f s: stamps %+.1f ppm vs frames, cycle %+.1f ppm vs capture "
             "(%+.0f frames); offset %d..%d frames, reported %d%s\n",
-            (int)capIn, (int)gDiag.capBufs.exchange(0), (int)gDiag.capGaps.exchange(0),
+            gNodeName, (int)capIn, (int)gDiag.capBufs.exchange(0), (int)gDiag.capGaps.exchange(0),
             (int)gDiag.capMaxStepUs.exchange(0), (int)gDiag.capDry.exchange(0), span / 1e6,
-            stampPpm, cyclePpm, cycleFrames - frames,
-            (int)gDiag.capLatMin.exchange(INT32_MAX), (int)gDiag.capLatMax.exchange(0),
+            stampPpm, cyclePpm, cycleFrames - frames, (int)gDiag.capLatMin.exchange(INT32_MAX),
+            (int)gDiag.capLatMax.exchange(0),
             (int)gNode->fInputs[capIn].latencyFrames.load(std::memory_order_relaxed),
             gHoldLatency.load(std::memory_order_relaxed) ? " (held)" : "");
 }
@@ -1983,13 +1995,13 @@ void midi_endpoint_name(const char *shortName, char *name, size_t len)
 {
     unsigned n;
     if (sscanf(shortName, "midi_in_%u", &n) == 1)
-        snprintf(name, len, "JackDAW MIDI in %u", n);
+        snprintf(name, len, "%s MIDI in %u", gNodeName, n);
     else if (sscanf(shortName, "midi_out_%u", &n) == 1)
-        snprintf(name, len, "JackDAW MIDI out %u", n);
+        snprintf(name, len, "%s MIDI out %u", gNodeName, n);
     else if (strcmp(shortName, "control_in") == 0)
-        snprintf(name, len, "JackDAW control in");
+        snprintf(name, len, "%s control in", gNodeName);
     else
-        snprintf(name, len, "JackDAW %s", shortName);
+        snprintf(name, len, "%s %s", gNodeName, shortName);
 }
 
 /* Another app's (or midi_server's hardware) endpoint named `name` (with or
@@ -2037,13 +2049,14 @@ void midi_disconnect_all(Port &port)
 int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, char *err,
             size_t errLen)
 {
-    (void)clientName; // the node is always called "JackDAW"
     if (gNode)
         return 0;
+    if (clientName && *clientName)
+        snprintf(gClientPrefix, sizeof gClientPrefix, "%s:", clientName);
     if (!BMediaRoster::IsRunning()) {
         snprintf(err, errLen,
                  "The media services are not running.\n"
-                 "Start them from the Media preferences, then launch JackDAW.");
+                 "Start them from the Media preferences, then try again.");
         return -1;
     }
     status_t status;
@@ -2057,8 +2070,8 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
     float rate = 48000.0f;
     int32 period = 512;
     if (!mixer_output_format(roster, &rate, &period))
-        fprintf(stderr, "JackDAW: the system mixer has no output; using %.0f Hz, %d frames\n", rate,
-                (int)period);
+        fprintf(stderr, "%s: the system mixer has no output; using %.0f Hz, %d frames\n", gNodeName,
+                rate, (int)period);
     if (period < 16 || period > 16384) {
         snprintf(err, errLen, "The system mixer's buffer length (%d frames) is not usable.",
                  (int)period);
@@ -2079,7 +2092,8 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
     setup_jacks(gNode);
     status = roster->RegisterNode(gNode);
     if (status != B_OK) {
-        snprintf(err, errLen, "Could not register the JackDAW media node: %s.", strerror(status));
+        snprintf(err, errLen, "Could not register the %s media node: %s.", gNodeName,
+                 strerror(status));
         gNode->Release();
         gNode = NULL;
         return -1;
@@ -2091,10 +2105,10 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
     }
 
     gMidiQuit.store(0);
-    gMidiSem = create_sem(0, "JackDAW MIDI out");
+    gMidiSem = create_sem(0, "media node MIDI out");
     if (gMidiSem >= 0) {
         gMidiThread =
-            spawn_thread(midi_writer_thread, "JackDAW MIDI writer", B_URGENT_PRIORITY, NULL);
+            spawn_thread(midi_writer_thread, "media node MIDI writer", B_URGENT_PRIORITY, NULL);
         if (gMidiThread >= 0)
             resume_thread(gMidiThread);
     }
@@ -2127,14 +2141,18 @@ int mk_activate(void)
         return -1;
 
     // Master and Metronome go to the system mixer, as JACK's playback_1/2.
+    // The Metronome only if a "metronome" port was registered before this
+    // (JackDAW's is); a host without one leaves no silent wire in Cortex.
     media_node mixer;
     if (roster->GetAudioMixer(&mixer) == B_OK) {
         gNode->fMixerPort.store(mixer.port, std::memory_order_relaxed);
         status_t e1 = connect_jack(roster, 0, mixer);
-        status_t e2 = connect_jack(roster, kMetronomeJack, mixer);
+        status_t e2 = B_OK;
+        if (gNode->fJacks[kMetronomeJack].active.load(std::memory_order_acquire))
+            e2 = connect_jack(roster, kMetronomeJack, mixer);
         if (e1 != B_OK || e2 != B_OK)
-            fprintf(stderr, "JackDAW: connecting to the system mixer: master %s, metronome %s\n",
-                    strerror(e1), strerror(e2));
+            fprintf(stderr, "%s: connecting to the system mixer: master %s, metronome %s\n",
+                    gNodeName, strerror(e1), strerror(e2));
         roster->ReleaseNode(mixer);
     }
 
@@ -2264,8 +2282,8 @@ JdPort *mk_port_register(const char *shortName, int type, int direction)
                 return NULL;
             endpoint->SetName(name);
             if (endpoint->Register() != B_OK)
-                fprintf(stderr, "JackDAW media: %s is not on the MIDI roster (midi_server?)\n",
-                        name);
+                fprintf(stderr, "%s media: %s is not on the MIDI roster (midi_server?)\n",
+                        gNodeName, name);
         } else {
             if (!port.audio)
                 port.audio = (float *)calloc((size_t)gNode->MaxPeriod(), sizeof(float));
@@ -2275,7 +2293,7 @@ JdPort *mk_port_register(const char *shortName, int type, int direction)
         port.type = type;
         port.direction = (direction & JD_PORT_INPUT) ? JD_PORT_INPUT : JD_PORT_OUTPUT;
         snprintf(port.shortName, sizeof port.shortName, "%s", shortName);
-        snprintf(port.fullName, sizeof port.fullName, "%s%s", kClientPrefix, shortName);
+        snprintf(port.fullName, sizeof port.fullName, "%s%s", gClientPrefix, shortName);
         port.route.store(-1);
         port.used.store(1, std::memory_order_release);
 
@@ -2473,7 +2491,7 @@ int midi_connect(const char *source, const char *destination, bool connect)
         consumer = (BMidiConsumer *)other;
     }
     if (!other) {
-        fprintf(stderr, "JackDAW media: MIDI %s %s -> %s: no such endpoint\n",
+        fprintf(stderr, "%s media: MIDI %s %s -> %s: no such endpoint\n", gNodeName,
                 connect ? "connect" : "disconnect", source ? source : "(null)",
                 destination ? destination : "(null)");
         return -1;
@@ -2495,7 +2513,7 @@ int mk_connect(const char *source, const char *destination)
         return midi_connect(source, destination, true);
     Port *port = port_by_full_name(destination);
     if (!port || port->type != JD_PORT_AUDIO || port->direction != JD_PORT_INPUT) {
-        fprintf(stderr, "JackDAW media: connect to %s: no such JackDAW capture port\n",
+        fprintf(stderr, "%s media: connect to %s: no such capture port\n", gNodeName,
                 destination ? destination : "(null)");
         return -1;
     }
@@ -2506,7 +2524,7 @@ int mk_connect(const char *source, const char *destination)
         if (strcmp(srcs[i].name, source) == 0)
             s = &srcs[i];
     if (!s) {
-        fprintf(stderr, "JackDAW media: connect %s: no such capture source\n", source);
+        fprintf(stderr, "%s media: connect %s: no such capture source\n", gNodeName, source);
         return -1;
     }
 
@@ -2524,7 +2542,7 @@ int mk_connect(const char *source, const char *destination)
         int32 n = 0;
         if (roster->GetFreeInputsFor(gNode->Node(), &free, 1, &n, B_MEDIA_RAW_AUDIO) != B_OK ||
             n < 1) {
-            fprintf(stderr, "JackDAW media: connect %s: JackDAW has no free input\n", source);
+            fprintf(stderr, "%s media: connect %s: no free input\n", gNodeName, source);
             return -1;
         }
         media_format fmt;
@@ -2534,8 +2552,8 @@ int mk_connect(const char *source, const char *destination)
         media_input madeIn;
         status_t err = roster->Connect(s->output.source, free.destination, &fmt, &madeOut, &madeIn);
         if (err != B_OK) {
-            fprintf(stderr, "JackDAW media: connecting %s to JackDAW failed: %s\n", source,
-                    strerror(err));
+            fprintf(stderr, "%s media: connecting %s to %s failed: %s\n", gNodeName, source,
+                    gNodeName, strerror(err));
             return -1;
         }
         BAutolock lock(gNode->fInputLock);
@@ -2548,8 +2566,8 @@ int mk_connect(const char *source, const char *destination)
     BAutolock lock(gNode->fInputLock);
     const Input &in = gNode->fInputs[input];
     if (!in.connected || s->channel >= in.channels) {
-        fprintf(stderr, "JackDAW media: connect %s: input %d is %s with %d channels\n", source,
-                (int)input, in.connected ? "connected" : "not connected", (int)in.channels);
+        fprintf(stderr, "%s media: connect %s: input %d is %s with %d channels\n", gNodeName,
+                source, (int)input, in.connected ? "connected" : "not connected", (int)in.channels);
         return -1;
     }
     port->route.store(((int32)in.generation << 16) | (input << 8) | s->channel,
@@ -2641,4 +2659,11 @@ const JdBackend kMediaKitBackend = {
 extern "C" const JdBackend *jackdaw_mediakit_backend_entry(uint32_t abi)
 {
     return abi == JD_BACKEND_ABI ? &kMediaKitBackend : NULL;
+}
+
+extern "C" void jackdaw_mediakit_set_node_name(const char *name)
+{
+    if (gNode || !name || !*name)
+        return;
+    snprintf(gNodeName, sizeof gNodeName, "%s", name);
 }

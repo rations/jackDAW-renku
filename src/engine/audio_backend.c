@@ -81,9 +81,6 @@ static void app_dir(char *out, size_t len)
     }
 }
 
-/* src/backend/mediakit/mediakit_backend.cpp */
-const JdBackend *jackdaw_mediakit_backend_entry(uint32_t abi);
-
 const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len)
 {
     if (which && strcmp(which, "mediakit") == 0) {

@@ -137,6 +137,16 @@ const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len
 typedef const JdBackend *(*JdBackendEntryFn)(uint32_t abi);
 #define JD_BACKEND_ENTRY_SYMBOL "jackdaw_backend_entry"
 
+/* The built-in Media Kit backend (src/backend/mediakit/mediakit_backend.cpp).
+ * Other hosts that build that file in (VST3-renku's vst3host) use it through
+ * these two calls as well. */
+const JdBackend *jackdaw_mediakit_backend_entry(uint32_t abi);
+
+/* The name of the media node, as Cortex shows it; its MIDI endpoints are
+ * "<name> MIDI in N" and so on. "JackDAW" unless set. Only takes effect if
+ * called before open. Non-RT. */
+void jackdaw_mediakit_set_node_name(const char *name);
+
 #ifdef __cplusplus
 }
 #endif
