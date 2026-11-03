@@ -135,6 +135,7 @@ static void jackdaw_track_init(JackDawTrack *t)
 
     t->rec_start_frame = 0;
     t->rec_latency = 0;
+    t->midi_rec_latency = 0;
     t->rec_peak_buf = NULL;
     t->rec_peak_count = 0;
     t->rec_peak_block = 0;

@@ -2873,6 +2873,13 @@ static void midi_arm_all(void)
         t->rec_start_frame = (off_t)engine.play_pos;
         if (t->midi_rec_buf)
             rt_ringbuffer_reset(t->midi_rec_buf);
+        /* A note reaches its capture frame this long after it is played (the
+         * Media Kit backend's fixed MIDI input delay; JACK reports its MIDI
+         * port latency); the take is shifted back by it. */
+        t->midi_rec_latency = 0;
+        if (be && (guint)t->midi_in_idx < JACKDAW_MAX_TRACKS && engine.midi_in &&
+            engine.midi_in[t->midi_in_idx])
+            t->midi_rec_latency = (off_t)be->port_capture_latency(engine.midi_in[t->midi_in_idx]);
     }
 }
 
@@ -3110,6 +3117,10 @@ void jackdaw_engine_finalize_midi_takes(void)
         MidiRecEvent r;
         while (rt_ringbuffer_read_space(t->midi_rec_buf) >= sizeof r) {
             rt_ringbuffer_read(t->midi_rec_buf, (char *)&r, sizeof r);
+            /* Back to where it was played: captured midi_rec_latency later. */
+            r.frame -= (gint64)t->midi_rec_latency;
+            if (r.frame < 0)
+                r.frame = 0;
             if (r.frame > last_frame)
                 last_frame = r.frame;
             int st = r.data[0] & 0xF0, ch = r.data[0] & 0x0F, p = r.data[1] & 0x7F;

@@ -107,6 +107,9 @@ struct _JackDawTrack {
      * a capture slot is opened. */
     off_t rec_start_frame;
     off_t rec_latency;
+    /* An instrument take's MIDI capture latency (frames from when a note was
+     * played to the frame it was captured at), sampled when it is armed. */
+    off_t midi_rec_latency;
 
     /* Live record waveform: one (min,max) float pair per JACK period, written
      * by the RT callback while recording and read by the UI overlay. Allocated
