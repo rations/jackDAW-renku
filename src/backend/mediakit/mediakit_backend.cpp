@@ -1189,7 +1189,7 @@ status_t JdMediaNode::PrepareToConnect(const media_source &what, const media_des
     o->fixedLength = fixedLength;
     o->output.destination = where;
     o->output.format = *format;
-    snprintf(o->output.name, sizeof o->output.name, "%s", fJacks[j].name);
+    strlcpy(o->output.name, fJacks[j].name, sizeof o->output.name);
     *source = o->output.source;
     strlcpy(name, o->output.name, B_MEDIA_NAME_LENGTH);
     return B_OK;
@@ -2266,7 +2266,8 @@ JdPort *mk_port_register(const char *shortName, int type, int direction)
             // Nothing reads or writes the ring while the slot is free, so
             // empty it as its reader.
             rt_ringbuffer_read_advance(port.midiRing, rt_ringbuffer_read_space(port.midiRing));
-            char name[64];
+            // Room for the longest node name and the longest suffix.
+            char name[B_MEDIA_NAME_LENGTH + 32];
             midi_endpoint_name(shortName, name, sizeof name);
             BMidiEndpoint *endpoint;
             if (direction & JD_PORT_INPUT) {
