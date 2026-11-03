@@ -68,6 +68,26 @@
  *  - A small looper watches the roster and turns its notifications into the
  *    engine's ports/connections/shutdown callbacks.
  *
+ * MIDI (Midi Kit 2, patched in PatchBay; the Media Kit carries no MIDI).
+ *  - Each engine MIDI port is an endpoint registered with the MIDI roster:
+ *    an input port a BMidiLocalConsumer, an output port a BMidiLocalProducer,
+ *    named "JackDAW MIDI in N", "JackDAW MIDI out N", "JackDAW control in".
+ *    The engine's connect(source, port) connects another endpoint by name.
+ *  - In: a consumer's own thread (the Midi Kit's, real-time priority) puts
+ *    each event and its time into a lock-free ring. The cycle that plays at
+ *    performance time P takes the events whose time falls in one period
+ *    ending at P's real time less the event and scheduling latency (when the
+ *    cycle nominally runs), each at its offset in that window. So every event
+ *    sounds the same fixed delay after it arrived, without jitter; that delay
+ *    is the MIDI ports' capture latency.
+ *  - Out: the cycle stamps each event with the real time its frame plays and
+ *    puts it in the port's ring; a writer thread sprays it (SprayData
+ *    allocates and locks). midi_server's hardware consumers wait for that
+ *    time before writing to the device, so MIDI out lines up with the audio.
+ *  - Endpoints and rings are made when a port slot is first registered as
+ *    MIDI and kept until close, like port buffers; unregistering disconnects
+ *    an endpoint and takes it off the roster.
+ *
  * Allocation: buffers and FIFOs are allocated when a port is registered or a
  * connection is made (the Media Kit runs connection hooks on the control
  * thread, as for every node), and buffer groups also when the period
@@ -85,6 +105,9 @@
 #include <MediaRoster.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
+#include <MidiConsumer.h>
+#include <MidiProducer.h>
+#include <MidiRoster.h>
 #include <OS.h>
 #include <TimeSource.h>
 
@@ -98,6 +121,7 @@
 #include <vector>
 
 #include "engine/audio_backend.h"
+#include "engine/rt_ringbuffer.h"
 
 namespace
 {
@@ -178,6 +202,51 @@ struct MidiBuffer {
     uint8 data[kMidiMaxEvents][4];
 };
 
+const char *kMidiPrefix = "midi:";
+const size_t kMidiRingBytes = 64 * 1024; // 4096 events
+
+/* One MIDI event in a port's ring: in, the time it arrived (system time, as
+ * midi_server's hardware producers stamp it, or 0 for "now"); out, the real
+ * time it is to play. Up to three bytes: the engine reads and writes no
+ * longer messages, and system exclusive is not passed. */
+struct MidiTimedEvent {
+    bigtime_t time;
+    uint8 size;
+    uint8 data[3];
+    uint8 pad[4];
+};
+
+/* A MIDI input port's endpoint. Data() runs on the consumer's own thread and
+ * is the ring's only writer. */
+class JdMidiIn : public BMidiLocalConsumer
+{
+public:
+    JdMidiIn(const char *name, rt_ringbuffer_t *ring) : BMidiLocalConsumer(name), fRing(ring)
+    {
+    }
+    void Data(uchar *data, size_t length, bool atomic, bigtime_t time) override
+    {
+        // One whole message per call (midi_server's producers spray them
+        // atomic); a raw byte stream or system exclusive is not passed on.
+        if (!atomic || length < 1 || length > 3 || !(data[0] & 0x80) || data[0] == 0xF0)
+            return;
+        MidiTimedEvent ev = {};
+        ev.time = time;
+        ev.size = (uint8)length;
+        memcpy(ev.data, data, length);
+        if (rt_ringbuffer_write_space(fRing) >= sizeof ev)
+            rt_ringbuffer_write(fRing, (const char *)&ev, sizeof ev);
+    }
+
+private:
+    rt_ringbuffer_t *fRing;
+};
+
+// The MIDI writer thread (sprays output rings) and its wakeup.
+sem_id gMidiSem = -1;
+thread_id gMidiThread = -1;
+std::atomic<int32> gMidiQuit{0};
+
 struct Port {
     std::atomic<int32> used{0}; // 1 while registered (release/acquire)
     int type = JD_PORT_AUDIO;
@@ -186,6 +255,10 @@ struct Port {
     char fullName[80] = "";
     float *audio = NULL;     // MaxPeriod() frames, kept until close
     MidiBuffer *midi = NULL; // kept until close
+    // MIDI endpoints and ring (see the file comment), kept until close.
+    JdMidiIn *midiIn = NULL;
+    BMidiLocalProducer *midiOut = NULL;
+    rt_ringbuffer_t *midiRing = NULL;
     // Inputs: (generation << 16) | (input << 8) | channel, or -1.
     std::atomic<int32> route{-1};
 };
@@ -385,6 +458,9 @@ public:
     // them; a BMessenger to a looper that has quit just fails to send.
     BMessenger fWatcher;
     std::atomic<port_id> fMixerPort{-1}; // the system mixer's control port
+    // How long after it arrives a MIDI input event plays, in frames (the
+    // MIDI ports' capture latency). Written each cycle.
+    std::atomic<int32> fMidiDelayFrames{0};
 
 protected:
     void NodeRegistered() override;
@@ -400,6 +476,8 @@ private:
     void _DiagCapture(int32 index, bigtime_t start, uint32 frames);
     void _DiagForgetCapture(int32 index);
     void _SendOutputs(bigtime_t performanceTime);
+    void _FillMidi(Port &port, bigtime_t performanceTime);
+    void _SendMidi(bigtime_t performanceTime);
     void _QueuePeriodCheck();
     void _FollowMixer(const FollowMixer &m);
     status_t _ChangePeriod(int32 period);
@@ -448,6 +526,21 @@ void RosterWatcher::MessageReceived(BMessage *message)
         case B_MEDIA_SERVER_QUIT:
             if (gCb.shutdown)
                 gCb.shutdown(gArg);
+            break;
+        case B_MIDI_EVENT:
+            switch (message->GetInt32("be:op", B_MIDI_NO_OP)) {
+                case B_MIDI_REGISTERED:
+                case B_MIDI_UNREGISTERED:
+                case B_MIDI_CHANGED_NAME:
+                    if (gCb.ports_changed)
+                        gCb.ports_changed(gArg);
+                    break;
+                case B_MIDI_CONNECTED:
+                case B_MIDI_DISCONNECTED:
+                    if (gCb.connections_changed)
+                        gCb.connections_changed(gArg);
+                    break;
+            }
             break;
         case MSG_DIAG_REPORT:
             print_diag();
@@ -499,8 +592,17 @@ JdMediaNode::~JdMediaNode()
 {
     Quit(); // waits for the control thread: no cycle runs after this
     for (int32 p = 0; p < kMaxPorts; p++) {
-        free(fPorts[p].audio);
-        free(fPorts[p].midi);
+        Port &port = fPorts[p];
+        free(port.audio);
+        free(port.midi);
+        // Taken off the roster and disconnected when unregistered (or by
+        // mk_close); releasing deletes them, which ends a consumer's thread.
+        if (port.midiIn)
+            port.midiIn->Release();
+        if (port.midiOut)
+            port.midiOut->Release();
+        if (port.midiRing)
+            rt_ringbuffer_free(port.midiRing);
     }
     for (int32 j = 0; j < kMaxJacks; j++)
         for (int32 c = 0; c < kMaxOutConns; c++)
@@ -1310,6 +1412,7 @@ void JdMediaNode::_RunCycle(bigtime_t performanceTime, bigtime_t lateness)
     if (gCb.process)
         gCb.process((jd_nframes_t)fPeriod, gArg);
     _SendOutputs(performanceTime);
+    _SendMidi(performanceTime);
     fCycles.fetch_add(1, std::memory_order_release);
 
     fFramesSent += (uint64)fPeriod;
@@ -1418,7 +1521,7 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
             continue;
         if (port.type == JD_PORT_MIDI) {
             if (port.direction == JD_PORT_INPUT)
-                port.midi->count = 0; // MIDI comes with the Midi Kit backend
+                _FillMidi(port, performanceTime);
             continue;
         }
         if (port.direction != JD_PORT_INPUT)
@@ -1431,6 +1534,75 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
         else
             memset(port.audio, 0, sizeof(float) * fPeriod);
     }
+}
+
+/* This cycle's MIDI input for one port: the events that arrived in the
+ * period before the cycle's nominal start (its performance time's real time
+ * less the event and scheduling latency), each at its offset in that window.
+ * Events that arrived later wait for the next cycle; late ones go first. */
+void JdMediaNode::_FillMidi(Port &port, bigtime_t performanceTime)
+{
+    MidiBuffer *m = port.midi;
+    m->count = 0;
+    if (!port.midiRing)
+        return;
+    bigtime_t delay = EventLatency() + SchedulingLatency() + BufferDuration();
+    fMidiDelayFrames.store((int32)(delay * (double)fRate / 1000000.0),
+                           std::memory_order_relaxed);
+    bigtime_t windowStart = TimeSource()->RealTimeFor(performanceTime, delay);
+    bigtime_t windowEnd = windowStart + BufferDuration();
+    uint32 last = 0;
+    MidiTimedEvent ev;
+    while (rt_ringbuffer_peek(port.midiRing, (char *)&ev, sizeof ev) == sizeof ev) {
+        if (ev.time >= windowEnd)
+            break;
+        rt_ringbuffer_read_advance(port.midiRing, sizeof ev);
+        if (m->count >= (uint32)kMidiMaxEvents)
+            continue; // a full buffer drops the rest of this period's events
+        uint32 offset = 0;
+        if (ev.time > windowStart)
+            offset = (uint32)((ev.time - windowStart) * (double)fRate / 1000000.0);
+        if (offset >= (uint32)fPeriod)
+            offset = (uint32)fPeriod - 1;
+        if (offset < last)
+            offset = last; // in time order, as the engine expects
+        last = offset;
+        uint32 i = m->count++;
+        memcpy(m->data[i], ev.data, ev.size);
+        m->events[i].time = offset;
+        m->events[i].size = ev.size;
+        m->events[i].buffer = m->data[i];
+    }
+}
+
+/* Hand this cycle's MIDI output to the writer thread, each event stamped with
+ * the real time its frame plays. */
+void JdMediaNode::_SendMidi(bigtime_t performanceTime)
+{
+    bool any = false;
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = fPorts[p];
+        if (port.type != JD_PORT_MIDI || port.direction != JD_PORT_OUTPUT ||
+            !port.used.load(std::memory_order_acquire))
+            continue;
+        MidiBuffer *m = port.midi;
+        for (uint32 i = 0; i < m->count && port.midiRing; i++) {
+            MidiTimedEvent ev = {};
+            bigtime_t at =
+                performanceTime + (bigtime_t)(m->events[i].time * 1000000.0 / (double)fRate);
+            ev.time = TimeSource()->RealTimeFor(at, 0);
+            ev.size = (uint8)m->events[i].size;
+            memcpy(ev.data, m->data[i], ev.size);
+            if (rt_ringbuffer_write_space(port.midiRing) >= sizeof ev) {
+                rt_ringbuffer_write(port.midiRing, (const char *)&ev, sizeof ev);
+                any = true;
+            }
+        }
+        m->count = 0; // sent once, even if the engine writes nothing next cycle
+    }
+    // Wakes the writer without waiting or rescheduling.
+    if (any && gMidiSem >= 0)
+        release_sem_etc(gMidiSem, 1, B_DO_NOT_RESCHEDULE);
 }
 
 void JdMediaNode::_SendOutputs(bigtime_t performanceTime)
@@ -1783,6 +1955,83 @@ void print_diag()
             gHoldLatency.load(std::memory_order_relaxed) ? " (held)" : "");
 }
 
+// ---- MIDI: writer thread and endpoints ----
+
+/* Sprays every MIDI output port's ring. Woken by the cycle (release_sem_etc)
+ * and every 100 ms to see whether to quit. */
+int32 midi_writer_thread(void *)
+{
+    while (!gMidiQuit.load(std::memory_order_acquire)) {
+        acquire_sem_etc(gMidiSem, 1, B_RELATIVE_TIMEOUT, 100000);
+        if (!gNode)
+            continue;
+        for (int32 p = 0; p < kMaxPorts; p++) {
+            Port &port = gNode->fPorts[p];
+            if (port.type != JD_PORT_MIDI || port.direction != JD_PORT_OUTPUT || !port.midiRing ||
+                !port.midiOut)
+                continue;
+            MidiTimedEvent ev;
+            while (rt_ringbuffer_read(port.midiRing, (char *)&ev, sizeof ev) == sizeof ev)
+                port.midiOut->SprayData(ev.data, ev.size, true, ev.time);
+        }
+    }
+    return 0;
+}
+
+/* The display name of a MIDI port's endpoint, from the engine's short name. */
+void midi_endpoint_name(const char *shortName, char *name, size_t len)
+{
+    unsigned n;
+    if (sscanf(shortName, "midi_in_%u", &n) == 1)
+        snprintf(name, len, "JackDAW MIDI in %u", n);
+    else if (sscanf(shortName, "midi_out_%u", &n) == 1)
+        snprintf(name, len, "JackDAW MIDI out %u", n);
+    else if (strcmp(shortName, "control_in") == 0)
+        snprintf(name, len, "JackDAW control in");
+    else
+        snprintf(name, len, "JackDAW %s", shortName);
+}
+
+/* Another app's (or midi_server's hardware) endpoint named `name` (with or
+ * without kMidiPrefix), acquired; Release() it. Ours are local and skipped. */
+BMidiEndpoint *find_remote_endpoint(const char *name, bool producer)
+{
+    if (!name)
+        return NULL;
+    if (strncmp(name, kMidiPrefix, strlen(kMidiPrefix)) == 0)
+        name += strlen(kMidiPrefix);
+    int32 id = 0;
+    while (BMidiEndpoint *e = producer ? (BMidiEndpoint *)BMidiRoster::NextProducer(&id)
+                                       : (BMidiEndpoint *)BMidiRoster::NextConsumer(&id)) {
+        if (e->IsRemote() && strcmp(e->Name(), name) == 0)
+            return e;
+        e->Release();
+    }
+    return NULL;
+}
+
+/* Disconnect a port's endpoint from every other endpoint. Non-RT. */
+void midi_disconnect_all(Port &port)
+{
+    int32 id = 0;
+    if (port.midiIn) {
+        while (BMidiProducer *p = BMidiRoster::NextProducer(&id)) {
+            if (p->IsConnected(port.midiIn))
+                p->Disconnect(port.midiIn);
+            p->Release();
+        }
+    }
+    if (port.midiOut) {
+        BList *conns = port.midiOut->Connections(); // acquired consumers, ours to free
+        for (int32 i = 0; conns && i < conns->CountItems(); i++) {
+            BMidiConsumer *c = (BMidiConsumer *)conns->ItemAt(i);
+            port.midiOut->Disconnect(c);
+            c->Release();
+        }
+        delete conns;
+    }
+}
+
 // ---- the JdBackend table ----
 
 int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, char *err,
@@ -1841,6 +2090,15 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
         roster->ReleaseNode(ts);
     }
 
+    gMidiQuit.store(0);
+    gMidiSem = create_sem(0, "JackDAW MIDI out");
+    if (gMidiSem >= 0) {
+        gMidiThread =
+            spawn_thread(midi_writer_thread, "JackDAW MIDI writer", B_URGENT_PRIORITY, NULL);
+        if (gMidiThread >= 0)
+            resume_thread(gMidiThread);
+    }
+
     gWatcher = new (std::nothrow) RosterWatcher();
     if (gWatcher) {
         gWatcher->Run();
@@ -1849,6 +2107,8 @@ int mk_open(const char *clientName, const JdBackendCallbacks *cb, void *arg, cha
         // The server's own quit notice only goes to watchers that ask for it
         // by name (BMediaRoster::StartWatching, MediaRoster.cpp).
         roster->StartWatching(BMessenger(gWatcher), B_MEDIA_SERVER_QUIT);
+        BMessenger watcher(gWatcher);
+        BMidiRoster::StartWatching(&watcher);
         const char *diag = getenv("JACKDAW_DIAG");
         gDiagOn = diag && *diag && strcmp(diag, "0") != 0;
         if (gDiagOn) {
@@ -1897,6 +2157,7 @@ void mk_close(void)
         if (gWatcher) {
             roster->StopWatching(BMessenger(gWatcher), B_MEDIA_SERVER_QUIT);
             roster->StopWatching(BMessenger(gWatcher));
+            BMidiRoster::StopWatching();
         }
         roster->StopNode(gNode->Node(), 0, true);
 
@@ -1925,6 +2186,30 @@ void mk_close(void)
         gWatcher->Lock();
         gWatcher->Quit();
         gWatcher = NULL;
+    }
+    // MIDI: off the roster and disconnected, so nothing reaches a consumer
+    // while it goes; then the writer stops (the node's destructor releases
+    // the endpoints and frees the rings).
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        Port &port = gNode->fPorts[p];
+        if (port.type != JD_PORT_MIDI || !port.used.load())
+            continue; // an unregistered port's endpoint is already off
+        midi_disconnect_all(port);
+        if (port.direction == JD_PORT_INPUT && port.midiIn)
+            port.midiIn->Unregister();
+        else if (port.direction == JD_PORT_OUTPUT && port.midiOut)
+            port.midiOut->Unregister();
+    }
+    if (gMidiThread >= 0) {
+        gMidiQuit.store(1, std::memory_order_release);
+        release_sem(gMidiSem);
+        status_t result;
+        wait_for_thread(gMidiThread, &result);
+        gMidiThread = -1;
+    }
+    if (gMidiSem >= 0) {
+        delete_sem(gMidiSem);
+        gMidiSem = -1;
     }
     // StopNode is asynchronous, so a cycle may still be running: the port
     // buffers are freed by the node's destructor, after Quit() has waited
@@ -1955,9 +2240,32 @@ JdPort *mk_port_register(const char *shortName, int type, int direction)
         if (type == JD_PORT_MIDI) {
             if (!port.midi)
                 port.midi = (MidiBuffer *)calloc(1, sizeof(MidiBuffer));
-            if (!port.midi)
+            if (!port.midiRing)
+                port.midiRing = rt_ringbuffer_create(kMidiRingBytes);
+            if (!port.midi || !port.midiRing)
                 return NULL;
             port.midi->count = 0;
+            // Nothing reads or writes the ring while the slot is free, so
+            // empty it as its reader.
+            rt_ringbuffer_read_advance(port.midiRing, rt_ringbuffer_read_space(port.midiRing));
+            char name[64];
+            midi_endpoint_name(shortName, name, sizeof name);
+            BMidiEndpoint *endpoint;
+            if (direction & JD_PORT_INPUT) {
+                if (!port.midiIn)
+                    port.midiIn = new (std::nothrow) JdMidiIn(name, port.midiRing);
+                endpoint = port.midiIn;
+            } else {
+                if (!port.midiOut)
+                    port.midiOut = new (std::nothrow) BMidiLocalProducer(name);
+                endpoint = port.midiOut;
+            }
+            if (!endpoint)
+                return NULL;
+            endpoint->SetName(name);
+            if (endpoint->Register() != B_OK)
+                fprintf(stderr, "JackDAW media: %s is not on the MIDI roster (midi_server?)\n",
+                        name);
         } else {
             if (!port.audio)
                 port.audio = (float *)calloc((size_t)gNode->MaxPeriod(), sizeof(float));
@@ -2001,6 +2309,13 @@ void mk_port_unregister(JdPort *jp)
             jk.active.store(0, std::memory_order_release);
     }
     port->route.store(-1, std::memory_order_release);
+    if (port->type == JD_PORT_MIDI) {
+        midi_disconnect_all(*port);
+        if (port->direction == JD_PORT_INPUT && port->midiIn)
+            port->midiIn->Unregister();
+        else if (port->direction == JD_PORT_OUTPUT && port->midiOut)
+            port->midiOut->Unregister();
+    }
     // The buffer stays: the cycle may be reading this slot right now.
     port->used.store(0, std::memory_order_release);
 }
@@ -2015,6 +2330,10 @@ jd_nframes_t mk_port_capture_latency(JdPort *jp)
     Port *port = (Port *)jp;
     if (!gNode || !port)
         return 0;
+    if (port->type == JD_PORT_MIDI) {
+        int32 frames = gNode->fMidiDelayFrames.load(std::memory_order_relaxed);
+        return port->direction == JD_PORT_INPUT && frames > 0 ? (jd_nframes_t)frames : 0;
+    }
     int32 r = port->route.load(std::memory_order_acquire);
     if (r < 0)
         return 0;
@@ -2054,12 +2373,14 @@ void mk_midi_clear(void *buf)
 
 int mk_midi_event_write(void *buf, jd_nframes_t time, const uint8_t *data, size_t size)
 {
-    // MIDI output comes with the Midi Kit backend; until then nothing reads
-    // these events, so they are dropped here.
-    (void)buf;
-    (void)time;
-    (void)data;
-    (void)size;
+    MidiBuffer *m = (MidiBuffer *)buf;
+    if (!m || !data || size < 1 || size > 3 || m->count >= (uint32)kMidiMaxEvents)
+        return -1;
+    uint32 i = m->count++;
+    memcpy(m->data[i], data, size);
+    m->events[i].time = time;
+    m->events[i].size = size;
+    m->events[i].buffer = m->data[i];
     return 0;
 }
 
@@ -2084,10 +2405,33 @@ const char **make_name_list(const std::vector<CaptureSource> &srcs)
     return (const char **)list;
 }
 
+/* Other endpoints on the MIDI roster: producers to take MIDI from (flags has
+ * JD_PORT_OUTPUT, as a JACK capture port), or consumers to send to. */
+const char **midi_get_ports(int flags)
+{
+    std::vector<CaptureSource> names; // only .name is used
+    bool producers = (flags & JD_PORT_OUTPUT) != 0;
+    int32 id = 0;
+    while (BMidiEndpoint *e = producers ? (BMidiEndpoint *)BMidiRoster::NextProducer(&id)
+                                        : (BMidiEndpoint *)BMidiRoster::NextConsumer(&id)) {
+        if (e->IsRemote()) {
+            CaptureSource s;
+            snprintf(s.name, sizeof s.name, "%s%s", kMidiPrefix, e->Name());
+            names.push_back(s);
+        }
+        e->Release();
+    }
+    return make_name_list(names);
+}
+
 const char **mk_get_ports(int type, int flags)
 {
-    if (!gNode || type != JD_PORT_AUDIO)
-        return NULL; // MIDI comes with the Midi Kit backend
+    if (!gNode)
+        return NULL;
+    if (type == JD_PORT_MIDI)
+        return midi_get_ports(flags);
+    if (type != JD_PORT_AUDIO)
+        return NULL;
     // Capture sources only: playback is reached by patching JackDAW's outputs
     // (in Cortex, or the automatic connection to the system mixer), so there
     // are no "physical playback ports" for the engine to connect itself to.
@@ -2103,8 +2447,52 @@ void mk_free_ports(const char **ports)
     free((void *)ports);
 }
 
+bool is_midi_port(const char *name)
+{
+    Port *port = port_by_full_name(name);
+    return port && port->type == JD_PORT_MIDI;
+}
+
+/* MIDI connect/disconnect: one side is our port (by full name), the other an
+ * endpoint on the roster (by name). 0 = ok, EEXIST = already connected. */
+int midi_connect(const char *source, const char *destination, bool connect)
+{
+    Port *in = port_by_full_name(destination);
+    Port *out = port_by_full_name(source);
+    BMidiProducer *producer = NULL;
+    BMidiConsumer *consumer = NULL;
+    BMidiEndpoint *other = NULL;
+    if (in && in->type == JD_PORT_MIDI && in->direction == JD_PORT_INPUT && in->midiIn) {
+        other = find_remote_endpoint(source, true);
+        producer = (BMidiProducer *)other;
+        consumer = in->midiIn;
+    } else if (out && out->type == JD_PORT_MIDI && out->direction == JD_PORT_OUTPUT &&
+               out->midiOut) {
+        other = find_remote_endpoint(destination, false);
+        producer = out->midiOut;
+        consumer = (BMidiConsumer *)other;
+    }
+    if (!other) {
+        fprintf(stderr, "JackDAW media: MIDI %s %s -> %s: no such endpoint\n",
+                connect ? "connect" : "disconnect", source ? source : "(null)",
+                destination ? destination : "(null)");
+        return -1;
+    }
+    int result = 0;
+    bool connected = producer->IsConnected(consumer);
+    if (connect && connected)
+        result = EEXIST;
+    else if (connect != connected && (connect ? producer->Connect(consumer)
+                                              : producer->Disconnect(consumer)) != B_OK)
+        result = -1;
+    other->Release();
+    return result;
+}
+
 int mk_connect(const char *source, const char *destination)
 {
+    if (is_midi_port(source) || is_midi_port(destination))
+        return midi_connect(source, destination, true);
     Port *port = port_by_full_name(destination);
     if (!port || port->type != JD_PORT_AUDIO || port->direction != JD_PORT_INPUT) {
         fprintf(stderr, "JackDAW media: connect to %s: no such JackDAW capture port\n",
@@ -2171,7 +2559,9 @@ int mk_connect(const char *source, const char *destination)
 
 int mk_disconnect(const char *source, const char *destination)
 {
-    (void)source; // a capture port reads one source, so the port says which
+    if (is_midi_port(source) || is_midi_port(destination))
+        return midi_connect(source, destination, false) == -1 ? -1 : 0;
+    // A capture port reads one source, so the port says which.
     Port *port = port_by_full_name(destination);
     if (!port || port->direction != JD_PORT_INPUT)
         return -1;

@@ -31,7 +31,7 @@ HOST_CXXFLAGS = $(CXXFLAGS) -I$(VST3_SDK) -DRELEASE=1
 # -ltracker: BFilePanel (open/save panels) lives in libtracker, not libbe.
 # No -ljack: JACK support is the backends/jack.so add-on (see below).
 # -lmedia: the built-in Media Kit backend.
-LDFLAGS  = -L$(NONPACKAGED)/lib -L$(VST3_LIB) -lbe -lmedia -ltracker \
+LDFLAGS  = -L$(NONPACKAGED)/lib -L$(VST3_LIB) -lbe -lmedia -lmidi2 -ltracker \
            -lsdk_hosting -lsdk_common -lbase -lpluginterfaces \
            $(LV2_LIBS) $(GLIB_LIBS) $(AUDIO_LIBS)
 
