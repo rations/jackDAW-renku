@@ -8,7 +8,11 @@
  *   1. $JACKDAW_BACKEND_DIR/jack.so, for testing a build
  *   2. backends/jack.so next to the JackDAW executable (a build tree)
  *   3. JackDAW/jack.so in the add-ons directories, user before system,
- *      non-packaged before packaged (the usual Haiku add-on search order) */
+ *      non-packaged before packaged (the usual Haiku add-on search order)
+ *
+ * Another application that builds these backends in (VST3-renku's hosts,
+ * NAMku) calls audio_backend_load_for with its own name and variable, so it
+ * looks for <name>/jack.so and $<variable>/jack.so instead. */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,17 +87,24 @@ static void app_dir(char *out, size_t len)
 
 const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len)
 {
+    return audio_backend_load_for(which, "JackDAW", "JACKDAW_BACKEND_DIR", err, err_len);
+}
+
+const JdBackend *audio_backend_load_for(const char *which, const char *app_name,
+                                        const char *env_var, char *err, size_t err_len)
+{
     if (which && strcmp(which, "mediakit") == 0) {
         const JdBackend *mk = jackdaw_mediakit_backend_entry(JD_BACKEND_ABI);
         if (!mk && err && err_len)
-            snprintf(err, err_len, "The Media Kit backend does not match this JackDAW.");
+            snprintf(err, err_len, "The Media Kit backend does not match this %s.", app_name);
         return mk;
     }
 
     status_t why = B_ENTRY_NOT_FOUND;
     const JdBackend *b;
+    char rest[B_FILE_NAME_LENGTH + 16];
 
-    const char *env = getenv("JACKDAW_BACKEND_DIR");
+    const char *env = env_var ? getenv(env_var) : NULL;
     if (env && *env && (b = try_path(env, "/" BACKEND_FILE, &why)) != NULL)
         return b;
 
@@ -111,18 +122,22 @@ const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len
     for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
         if (find_directory(dirs[i], -1, false, dir, sizeof dir) != B_OK)
             continue;
-        if ((b = try_path(dir, "/JackDAW/" BACKEND_FILE, &why)) != NULL)
+        int n = snprintf(rest, sizeof rest, "/%s/" BACKEND_FILE, app_name);
+        if (n < 0 || (size_t)n >= sizeof rest)
+            break; /* a name that does not fit is not looked for */
+        if ((b = try_path(dir, rest, &why)) != NULL)
             return b;
     }
 
     if (err && err_len) {
         if (why == B_ENTRY_NOT_FOUND)
             snprintf(err, err_len,
-                     "JACK support is not installed: no JackDAW/" BACKEND_FILE
-                     " add-on was found.");
+                     "JACK support is not installed: no %s/" BACKEND_FILE " add-on was found.",
+                     app_name);
         else if (why == B_MISMATCHED_VALUES || why == B_BAD_VALUE)
             snprintf(err, err_len,
-                     "The JACK support add-on (" BACKEND_FILE ") does not match this JackDAW.");
+                     "The JACK support add-on (" BACKEND_FILE ") does not match this %s.",
+                     app_name);
         else
             snprintf(err, err_len,
                      "The JACK support add-on (" BACKEND_FILE ") could not be loaded: %s.\n"

@@ -132,6 +132,12 @@ typedef struct JdBackend {
  * NULL, with a message for the user in err, if it is not available. */
 const JdBackend *audio_backend_load(const char *which, char *err, size_t err_len);
 
+/* The same for another application: the JACK add-on is looked for in
+ * $<env_var>/jack.so, backends/jack.so next to the executable, and
+ * <app_name>/jack.so in the add-ons directories; messages name app_name. */
+const JdBackend *audio_backend_load_for(const char *which, const char *app_name,
+                                        const char *env_var, char *err, size_t err_len);
+
 /* Entry point a backend exports (looked up by name when it is an add-on).
  * Returns NULL if it does not speak `abi`. */
 typedef const JdBackend *(*JdBackendEntryFn)(uint32_t abi);

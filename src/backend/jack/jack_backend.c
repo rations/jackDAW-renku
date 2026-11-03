@@ -101,7 +101,7 @@ static int jb_open(const char *client_name, const JdBackendCallbacks *cb, void *
         if (err && err_len)
             snprintf(err, err_len,
                      "Could not connect to the JACK server.\n"
-                     "Start JACK first (e.g. from Jack Graph), then launch JackDAW.");
+                     "Start JACK first (e.g. from Jack Graph), then try again.");
         return -1;
     }
 
