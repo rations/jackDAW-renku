@@ -1859,6 +1859,8 @@ static int engine_buffer_size_cb(jd_nframes_t nframes, void *arg)
         engine.buf_cap = nframes;
     }
     engine.buf_size = nframes;
+    if (engine.sample_rate)
+        g_diag_period_us = (gint64)nframes * 1000000 / engine.sample_rate;
 
     return 0;
 }

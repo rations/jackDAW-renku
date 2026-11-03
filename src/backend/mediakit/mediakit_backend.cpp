@@ -42,8 +42,12 @@
  *  - The system mixer, when its output changes, tells its producers of its
  *    new latency (LatencyChanged). The roster watcher then reads the mixer's
  *    output format, and the node follows its period when all its outputs go
- *    to the mixer. The mixer takes input buffers of any length (it reads
- *    each buffer's size_used), so it needs no notice.
+ *    to the mixer. The mixer reads each buffer's size_used, but sizes its
+ *    ring for an input from the length in the connection's format (three
+ *    of them, or two output buffers); a longer buffer overruns it, and it
+ *    crashed the mixer in testing. So a consumer that leaves the length
+ *    open (the mixer does) is given the longest period we may change to,
+ *    and every buffer sent is one period, within it.
  * The engine's mix buffers, the port buffers and the input FIFOs are sized
  * for the longest period up front (JD_MAX_PERIOD, or the period at open if
  * longer), so a change allocates nothing but the new buffer groups, as a
@@ -193,6 +197,9 @@ struct OutConn {
     media_output output;
     BBufferGroup *group = NULL;
     bool ownGroup = false; // group is ours (not the consumer's)
+    // The consumer chose the buffer length (a hardware input: exactly its
+    // own); otherwise the format carries the longest we may send.
+    bool fixedLength = false;
     bigtime_t groupLead = 0; // how far ahead of play our group has buffers for
     bigtime_t latency = 0; // downstream
 };
@@ -900,6 +907,10 @@ status_t JdMediaNode::FormatChangeRequested(const media_source &source,
         a.format != now.format || a.byte_order != now.byte_order || frame == 0 ||
         a.buffer_size % frame != 0)
         return B_MEDIA_BAD_FORMAT;
+    // A connection with an open length carries the longest we may send,
+    // and keeps it: only a consumer that chose its length sets the period.
+    if (!o->fixedLength)
+        return a.buffer_size == now.buffer_size ? B_OK : B_MEDIA_BAD_FORMAT;
     int32 period = (int32)(a.buffer_size / frame);
     if (period == fPeriod)
         return B_OK;
@@ -1037,8 +1048,11 @@ status_t JdMediaNode::PrepareToConnect(const media_source &what, const media_des
         a.byte_order = B_MEDIA_HOST_ENDIAN;
     size_t frame = (size_t)a.channel_count * sample_size(a.format);
     size_t want = (size_t)fPeriod * frame;
-    if (a.buffer_size == w.buffer_size)
-        a.buffer_size = want;
+    // A consumer that leaves the length open gets the longest we may send:
+    // it sizes its buffering for that, and the period may grow up to it.
+    bool fixedLength = a.buffer_size != w.buffer_size;
+    if (!fixedLength)
+        a.buffer_size = want = (size_t)fMaxPeriod * frame;
     // Our clock is the hardware's: refuse another rate or buffer length rather
     // than resample.
     if (fabsf(a.frame_rate - fRate) > 0.5f || a.channel_count != (uint32)fJacks[j].channels ||
@@ -1058,6 +1072,7 @@ status_t JdMediaNode::PrepareToConnect(const media_source &what, const media_des
         return B_MEDIA_BAD_DESTINATION;
 
     o->reserved = true;
+    o->fixedLength = fixedLength;
     o->output.destination = where;
     o->output.format = *format;
     snprintf(o->output.name, sizeof o->output.name, "%s", fJacks[j].name);
@@ -1099,6 +1114,7 @@ void JdMediaNode::Disconnect(const media_source &what, const media_destination &
         return;
     o->connected = false;
     o->reserved = false;
+    o->fixedLength = false;
     o->output.destination = media_destination::null;
     delete o->group;
     o->group = NULL;
@@ -1206,8 +1222,11 @@ status_t JdMediaNode::_ChangePeriod(int32 period)
             OutConn &o = fJacks[j].conns[c];
             if (!o.reserved)
                 continue;
+            // A fixed length is the consumer's, which asked for this one; an
+            // open one already allows every period up to fMaxPeriod.
             media_raw_audio_format &a = o.output.format.u.raw_audio;
-            a.buffer_size = (size_t)period * a.channel_count * sample_size(a.format);
+            if (o.fixedLength)
+                a.buffer_size = (size_t)period * a.channel_count * sample_size(a.format);
             if (!o.connected)
                 continue;
             media_node_id ts;
@@ -1431,20 +1450,21 @@ void JdMediaNode::_SendOutputs(bigtime_t performanceTime)
             if (!o.connected || !o.enabled || !o.group)
                 continue;
             const media_raw_audio_format &a = o.output.format.u.raw_audio;
-            BBuffer *buf = o.group->RequestBuffer(a.buffer_size, 0); // never wait
+            size_t ss = sample_size(a.format);
+            size_t bytes = (size_t)fPeriod * jk.channels * ss; // <= a.buffer_size
+            BBuffer *buf = o.group->RequestBuffer(bytes, 0); // never wait
             if (!buf) {
                 gDiag.noBuffer.fetch_add(1, std::memory_order_relaxed);
                 notify_xrun();
                 continue;
             }
-            size_t ss = sample_size(a.format);
             char *dst = (char *)buf->Data();
             for (int32 f = 0; f < fPeriod; f++)
                 for (int32 c = 0; c < jk.channels; c++, dst += ss)
                     write_sample(dst, a.format, chan[c] ? chan[c][f] : 0.0f);
             media_header *h = buf->Header();
             h->type = B_MEDIA_RAW_AUDIO;
-            h->size_used = a.buffer_size;
+            h->size_used = bytes;
             h->time_source = TimeSource()->ID();
             h->start_time = performanceTime;
             if (gDiagOn) {
