@@ -2966,12 +2966,25 @@ void jackdaw_engine_finalize_takes(void)
         } else if (clip) {
             /* Place the recording as a new region at the start point, shifted
              * earlier by the capture latency so it sits under the audio the
-             * performer actually played against. */
+             * performer actually played against. A take started within the
+             * latency of the timeline's start cannot move that far back, so
+             * the frames it is late by are trimmed off its start instead
+             * (clamping the position to 0 used to leave a take recorded from
+             * the start uncorrected). A take is at the engine rate, so file
+             * and timeline frames are the same. */
             off_t tl = rf->track->rec_start_frame - rf->track->rec_latency;
-            if (tl < 0)
+            off_t trim = 0;
+            if (tl < 0) {
+                trim = -tl;
                 tl = 0;
+            }
+            if (g_diag_on)
+                g_message("[diag] take on track \"%s\": capture latency %lld frames, "
+                          "placed at %lld, trimmed %lld",
+                          rf->track->name ? rf->track->name : "?",
+                          (long long)rf->track->rec_latency, (long long)tl, (long long)trim);
             rf->track->clip_start = tl;
-            jackdaw_track_place_clip(rf->track, clip, tl); /* consumes clip ref */
+            jackdaw_track_place_clip_from(rf->track, clip, trim, tl); /* consumes clip ref */
         } else {
             g_warning("jackdaw: could not load recording %s: %s", rf->path,
                       err ? err->message : "unknown");

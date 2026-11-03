@@ -189,10 +189,18 @@ AudioClip *jackdaw_track_get_clip(JackDawTrack *t)
 
 void jackdaw_track_place_clip(JackDawTrack *t, AudioClip *clip, off_t tl_pos)
 {
+    jackdaw_track_place_clip_from(t, clip, 0, tl_pos);
+}
+
+void jackdaw_track_place_clip_from(JackDawTrack *t, AudioClip *clip, off_t file_in, off_t tl_pos)
+{
     g_return_if_fail(JACKDAW_IS_TRACK(t));
     if (!clip)
         return;
-    ClipRegion *r = clip_region_new(clip, 0, clip_timeline_length(clip), tl_pos);
+    off_t length = clip_timeline_length(clip);
+    if (file_in < 0 || file_in >= length)
+        file_in = 0; /* nothing would be left: place it whole */
+    ClipRegion *r = clip_region_new(clip, file_in, length - file_in, tl_pos);
     g_ptr_array_add(t->regions, r);
     clip_region_list_sort(t->regions);
     audio_clip_free(clip); /* consume caller's reference */
