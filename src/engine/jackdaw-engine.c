@@ -117,8 +117,12 @@ typedef struct {
     /* Punch in/out. record_mode selects it; punch_armed is set on the main
      * thread when playback starts in punch mode with a tab region ahead of the
      * playhead, and cleared by the RT path (or a stop) once the punch completes.
-     * While armed the RT path auto-engages RECORDING across [loop_start,loop_end). */
+     * While armed the RT path auto-engages RECORDING across [loop_start,loop_end),
+     * shifted later by punch_latency: what is played over the region reaches
+     * the input that much later. Written on the main thread before punch_armed
+     * is set; read by the RT path after it sees punch_armed. */
     volatile gint punch_armed;
+    volatile off_t punch_latency;
 
     /* Count-in pre-roll. While countin_active the transport is in a metronome-
      * only lead-in: the project is frozen (play_pos does not advance) and nothing
@@ -717,6 +721,11 @@ typedef struct {
     int punch;                      /* 1 = punch take; overwrites a region on finalize */
     off_t punch_tl_start;           /* loop_start at arm time (timeline frames) */
     off_t punch_tl_end;             /* loop_end   at arm time (timeline frames) */
+    /* Timeline frame the take's first captured frame was played against, before
+     * the latency shift: the start of the block in which the RT path engaged the
+     * punch. RT writes it before the first capture write; the recorder thread
+     * reads it after draining (the ringbuffer's release/acquire orders the two). */
+    volatile off_t punch_cap_tl;
 } RecorderSlot;
 
 static RecorderSlot recorder_slots[JACKDAW_MAX_TRACKS];
@@ -736,6 +745,8 @@ typedef struct {
     int punch; /* 1 = overwrite [punch_tl_start, punch_tl_end) */
     off_t punch_tl_start;
     off_t punch_tl_end;
+    off_t punch_cap_tl; /* see RecorderSlot */
+    off_t written;      /* frames in the file */
 } RecordFinalize;
 
 static GAsyncQueue *recorder_done_q; /* of RecordFinalize*; created at recorder_start */
@@ -794,9 +805,9 @@ static void recorder_slot_finalize(guint i)
         g_strlcpy(rf->path, rs->path, sizeof(rf->path));
         rf->punch = rs->punch;
         rf->punch_tl_start = rs->punch_tl_start;
-        /* Overwrite exactly the span captured: on an early stop (punch-out never
-         * reached) only the recorded portion is replaced. */
-        rf->punch_tl_end = rs->punch_tl_start + rs->written;
+        rf->punch_tl_end = rs->punch_tl_end;
+        rf->punch_cap_tl = rs->punch_cap_tl;
+        rf->written = rs->written;
         g_async_queue_push(recorder_done_q, rf);
         engine_post_event(JACKDAW_ENGINE_EVENT_TAKE_FINALIZED);
     }
@@ -1501,16 +1512,24 @@ static int engine_process(jd_nframes_t nframes, void *arg)
      * pass acts on it. The capture slots were pre-opened in start_playback, so no
      * file I/O happens here. */
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.punch_armed)) {
-        off_t ls = rt_loop.start;
-        off_t le = rt_loop.end;
+        /* The capture window is the region shifted by the capture latency, and
+         * whole blocks: the block that crosses its start is the first captured,
+         * the one that crosses its end the last. Finalize trims the take back
+         * to the region exactly. */
+        off_t lat = engine.punch_latency;
+        off_t ls = rt_loop.start + lat;
+        off_t le = rt_loop.end + lat;
         off_t bstart = engine.play_pos - (off_t)nframes;
         if (le > ls) {
             if (!(flags & ENGINE_RECORDING)) {
                 if (engine.play_pos > ls && bstart < le) { /* crossed into region */
+                    for (guint p = 0; p < JACKDAW_MAX_TRACKS; p++)
+                        if (recorder_slots[p].sf && recorder_slots[p].punch)
+                            recorder_slots[p].punch_cap_tl = bstart;
                     g_atomic_int_or(&engine.transport_flags, ENGINE_RECORDING);
                     flags |= ENGINE_RECORDING;
                 }
-            } else if (engine.play_pos >= le) { /* reached region end */
+            } else if (bstart >= le) { /* the block before captured the region end */
                 g_atomic_int_and(&engine.transport_flags, ~ENGINE_RECORDING);
                 flags &= ~ENGINE_RECORDING;
                 for (guint p = 0; p < JACKDAW_MAX_TRACKS; p++)
@@ -2870,6 +2889,7 @@ void jackdaw_engine_start_playback(void)
     if (g_atomic_int_get(&engine.record_mode) == RECORD_MODE_PUNCH &&
         !g_atomic_int_get(&engine.punch_armed) && le > ls && engine.play_pos < le) {
         gboolean any = FALSE;
+        off_t lat = 0;
         for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
             JackDawTrack *t = engine.slots[i];
             if (!t)
@@ -2880,15 +2900,24 @@ void jackdaw_engine_start_playback(void)
                 continue;
             if (t->audio_in_idx < 0)
                 continue;
-            if (!recorder_open_slot(i, t, ls, le - ls))
+            /* Open-ended: the capture window is shifted by the latency and is
+             * whole blocks, so it runs past the region's length; finalize trims. */
+            if (!recorder_open_slot(i, t, ls, 0))
                 continue;
             recorder_slots[i].punch = 1;
             recorder_slots[i].punch_tl_start = ls;
             recorder_slots[i].punch_tl_end = le;
+            recorder_slots[i].punch_cap_tl = ls;
+            if (t->rec_latency > lat)
+                lat = t->rec_latency; /* sampled by recorder_open_slot */
             any = TRUE;
         }
-        if (any)
+        if (any) {
+            /* One capture window for all punch tracks: the longest latency, so
+             * every track's take covers its region (each is placed by its own). */
+            engine.punch_latency = lat;
             g_atomic_int_set(&engine.punch_armed, 1);
+        }
     }
 
     g_atomic_int_or(&engine.transport_flags, ENGINE_PLAYING);
@@ -2960,6 +2989,9 @@ void jackdaw_engine_stop_recording(void)
             continue;
         JackDawTrack *t = engine.slots[i];
         off_t exp = t ? (cut - t->rec_start_frame) : 0;
+        /* A punch take keeps all it captured; finalize trims it to the region. */
+        if (recorder_slots[i].punch)
+            exp = 0;
         recorder_slots[i].expected_frames = exp > 0 ? exp : 0;
         g_atomic_int_set(&recorder_slots[i].finalize_req, 1);
     }
@@ -2987,14 +3019,29 @@ void jackdaw_engine_finalize_takes(void)
         GError *err = NULL;
         AudioClip *clip = audio_clip_new(rf->path, &err);
         if (clip && rf->punch) {
-            /* Punch take: overwrite the existing audio in the tab region, then
-             * drop the new clip in at the punch-in point (no latency shift — it
-             * must line up exactly with the cleared range). */
+            /* Punch take: its first frame was played against punch_cap_tl less
+             * the capture latency. Keep the part inside the tab region (the RT
+             * path captured whole blocks of the region shifted by the punch
+             * latency, so a little more), and overwrite exactly that span: all
+             * of the region, or up to where an early stop cut the take. */
             int sr = (int)jackdaw_engine_get_sample_rate();
-            GPtrArray *regions = jackdaw_track_get_regions(rf->track);
-            clip_region_list_delete_range(regions, rf->punch_tl_start, rf->punch_tl_end, sr);
-            rf->track->clip_start = rf->punch_tl_start;
-            jackdaw_track_place_clip(rf->track, clip, rf->punch_tl_start);
+            off_t tl = rf->punch_cap_tl - rf->track->rec_latency;
+            off_t start = MAX(tl, rf->punch_tl_start);
+            off_t end = MIN(tl + rf->written, rf->punch_tl_end);
+            if (g_diag_on)
+                g_message("[diag] punch take on track \"%s\": captured from %lld, capture "
+                          "latency %lld frames, placed %lld..%lld of region %lld..%lld",
+                          rf->track->name ? rf->track->name : "?", (long long)rf->punch_cap_tl,
+                          (long long)rf->track->rec_latency, (long long)start, (long long)end,
+                          (long long)rf->punch_tl_start, (long long)rf->punch_tl_end);
+            if (end > start) {
+                GPtrArray *regions = jackdaw_track_get_regions(rf->track);
+                clip_region_list_delete_range(regions, start, end, sr);
+                rf->track->clip_start = start;
+                jackdaw_track_place_clip_part(rf->track, clip, start - tl, end - start, start);
+            } else {
+                audio_clip_free(clip);
+            }
         } else if (clip) {
             /* Place the recording as a new region at the start point, shifted
              * earlier by the capture latency so it sits under the audio the

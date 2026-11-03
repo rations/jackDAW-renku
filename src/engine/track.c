@@ -207,6 +207,26 @@ void jackdaw_track_place_clip_from(JackDawTrack *t, AudioClip *clip, off_t file_
     jackdaw_track_commit_regions(t);
 }
 
+void jackdaw_track_place_clip_part(JackDawTrack *t, AudioClip *clip, off_t file_in, off_t length,
+                                   off_t tl_pos)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (!clip)
+        return;
+    off_t have = clip_timeline_length(clip) - file_in;
+    if (length > have)
+        length = have;
+    if (file_in < 0 || length <= 0) {
+        audio_clip_free(clip);
+        return;
+    }
+    ClipRegion *r = clip_region_new(clip, file_in, length, tl_pos);
+    g_ptr_array_add(t->regions, r);
+    clip_region_list_sort(t->regions);
+    audio_clip_free(clip); /* consume caller's reference */
+    jackdaw_track_commit_regions(t);
+}
+
 void jackdaw_track_set_clip(JackDawTrack *t, AudioClip *new_clip)
 {
     g_return_if_fail(JACKDAW_IS_TRACK(t));

@@ -170,6 +170,11 @@ void jackdaw_track_place_clip(JackDawTrack *t, AudioClip *clip, off_t tl_pos);
 /* As place_clip, starting file_in frames into the clip (file_in must be in
  * timeline frames too, i.e. the clip is at the engine rate, as a take is). */
 void jackdaw_track_place_clip_from(JackDawTrack *t, AudioClip *clip, off_t file_in, off_t tl_pos);
+/* As jackdaw_track_place_clip_from, but only `length` timeline frames of the
+ * clip from file_in (clamped to what the clip has). Consumes the clip ref; a
+ * span with nothing in it places nothing. */
+void jackdaw_track_place_clip_part(JackDawTrack *t, AudioClip *clip, off_t file_in, off_t length,
+                                   off_t tl_pos);
 
 /* Borrowed region list — edit in place, then call jackdaw_track_commit_regions(). */
 GPtrArray *jackdaw_track_get_regions(JackDawTrack *t);
