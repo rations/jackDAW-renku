@@ -17,7 +17,7 @@ REVISION="1"
 SOURCE_URI="git+https://github.com/rations/jackDAW-haiku#master"
 SOURCE_DIR="jackDAW-haiku"
 # Second source: the VST3-haiku SDK JackDAW builds and links against.
-SOURCE_URI_2="git+https://github.com/rations/VST3-haiku#master"
+SOURCE_URI_2="git+https://github.com/rations/VST3-renku#master"
 SOURCE_DIR_2="VST3-haiku"
 ARCHITECTURES="x86_64"
 

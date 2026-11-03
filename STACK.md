@@ -25,8 +25,9 @@ Release 0.5 targets **Haiku nightly hrev60256, x86_64**.
         ├─► jack-example-tools ─► jack_tools   jack_lsp / jack_connect / jack_transport / ...
         ├─► jack-graph-haiku   ─► jackgraph    native patchbay + start/stop/settings GUI
         │
-  VST3-haiku ───────────────► vst3_haiku  JACK VST3 host + example plug-ins
-        │  (VST3 SDK, static, MIT)          (SDK is a build-time dep of the DAW + plug-ins)
+  VST3-renku ───────────────► vst3_renku       Media Kit VST3 host (vst3host) + example plug-ins
+        │  (VST3 SDK, static, MIT) vst3_renku_jack  JACK VST3 host (vst3jackhost), optional
+        │                          (SDK is a build-time dep of the DAW + plug-ins)
         ├─► NAMku  ───────────► namku       Neural Amp Modeler VST3
         ├─► DRUMku ───────────► drumku      MIDI drum-sampler VST3 instrument
         │
@@ -51,7 +52,8 @@ linked statically, but lilv needs the LV2 **specification bundles** it installs 
 | `jack` | 1.9.23-7 | [jack-port-haiku](https://github.com/rations/jack-port-haiku) | JACK2 server, libjack, audio/MIDI backends | GPL v2 / LGPL v2.1 |
 | `jack_tools` | 4-2 | [jack-example-tools](https://github.com/rations/jack-example-tools) | standard JACK CLI utilities | GPL v2 |
 | `jackgraph` | 0.2-1 | [jack-graph-haiku](https://github.com/rations/jack-graph-haiku) | native patchbay + server control GUI | MIT |
-| `vst3_haiku` | 0.3.0-2 | [VST3-haiku](https://github.com/rations/VST3-haiku) | JACK VST3 host + example plug-ins (+ the SDK) | MIT |
+| `vst3_renku` | 0.4.0-1 | [VST3-renku](https://github.com/rations/VST3-renku) | Media Kit VST3 host (`vst3host`) + example plug-ins (+ the SDK); replaces `vst3_haiku` | MIT |
+| `vst3_renku_jack` | 0.4.0-1 | [VST3-renku](https://github.com/rations/VST3-renku) | JACK VST3 host (`vst3jackhost`), optional | MIT |
 | `lv2_haiku` | 0.3.0-2 | [LV2-haiku](https://github.com/rations/LV2-haiku) | LV2 stack + spec bundles, JACK LV2 host + tools | ISC |
 | `namku` | 0.4.0-1 | [NAMku](https://github.com/rations/NAMku) | Neural Amp Modeler VST3 | MIT (+ MPL 2.0, Eigen) |
 | `drumku` | 0.4.0-1 | [DRUMku](https://github.com/rations/DRUMku) | MIDI drum-sampler VST3 | MIT |
@@ -177,7 +179,7 @@ order follows the dependencies:
 jack-port-haiku      # libjack
 jack-example-tools   # needs jack
 jack-graph-haiku     # needs jack
-VST3-haiku           # SDK static libs + vst3jackhost
+VST3-renku           # SDK static libs + vst3host (+ vst3jackhost if jack is installed)
 LV2-haiku            # lilv/serd/sord/sratom/zix static + spec bundles + lv2jackhost
 NAMku                # needs the VST3-haiku SDK
 DRUMku               # needs the VST3-haiku SDK
