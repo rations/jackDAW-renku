@@ -178,6 +178,31 @@ static JackDawEngine engine;
  * while it is valid. NULL while no client is open. */
 static const JdBackend *be;
 
+/* Which backend jackdaw_engine_init opened ("mediakit" or "jack"; "" when none
+ * opened), and why it is not the one chosen (NULL when it is). Written only by
+ * jackdaw_engine_init on the application thread before the main window is
+ * shown, read-only after that; they stay valid until the process exits. */
+static char eng_backend_key[16];
+static gchar *eng_backend_notice;
+
+/* Load and open one backend. NULL with err set when it cannot be used. */
+static const JdBackend *engine_open_backend(const char *which, const JdBackendCallbacks *cbs,
+                                            char *err, size_t err_len)
+{
+    const JdBackend *b = audio_backend_load(which, err, err_len);
+    if (!b) {
+        if (!err[0])
+            g_strlcpy(err, "No audio backend is available.", err_len);
+        return NULL;
+    }
+    if (b->open("jackdaw", cbs, NULL, err, err_len) != 0) {
+        if (!err[0])
+            g_strlcpy(err, "Could not open the audio system.", err_len);
+        return NULL;
+    }
+    return b;
+}
+
 static volatile gint engine_xruns = 0;
 /* Process-callback counter, incremented once per cycle on the RT thread. Reused
  * by non-RT code that must know the RT thread has moved past a retired
@@ -1960,21 +1985,39 @@ gboolean jackdaw_engine_init(JackDawProject *project)
             engine_process,     engine_buffer_size_cb, engine_thread_init_cb,  engine_xrun_cb,
             engine_shutdown_cb, engine_port_reg_cb,    engine_port_connect_cb,
         };
-        /* JACK unless JACKDAW_BACKEND or the "audioBackend" setting says
-         * "mediakit" (the RenkuOS media services). */
+        /* The Media Kit (the RenkuOS media services) unless JACKDAW_BACKEND
+         * or the "audioBackend" setting (Options -> Audio System) says "jack".
+         * JACK joins only a server the user already started; when that fails,
+         * run on the Media Kit and say why rather than run without audio. */
         const char *env = g_getenv("JACKDAW_BACKEND");
-        gchar *which = env ? g_strdup(env) : settings_get_string("audioBackend", "jack");
-        be = audio_backend_load(which, err, sizeof err);
+        gchar *which = env ? g_strdup(env) : settings_get_string("audioBackend", "mediakit");
+        const char *key = strcmp(which, "jack") == 0 ? "jack" : "mediakit";
         g_free(which);
+        g_clear_pointer(&eng_backend_notice, g_free);
+        eng_backend_key[0] = '\0';
+
+        be = engine_open_backend(key, &cbs, err, sizeof err);
+        if (!be && strcmp(key, "jack") == 0) {
+            char mk_err[256] = "";
+            be = engine_open_backend("mediakit", &cbs, mk_err, sizeof mk_err);
+            if (be) {
+                key = "mediakit";
+                eng_backend_notice = g_strdup_printf(
+                    "JACK could not be used, so JackDAW is running on the Media Kit.\n\n%s\n\n"
+                    "Start the JACK server, then choose Options \xe2\x86\x92 Audio System "
+                    "\xe2\x86\x92 JACK.",
+                    err);
+            } else {
+                g_strlcpy(err, mk_err, sizeof err);
+            }
+        }
         if (!be) {
-            jackdaw_error(err[0] ? err : "No audio backend is available.");
+            eng_backend_notice =
+                g_strdup_printf("JackDAW is running without audio.\n\n%s", err);
+            jackdaw_error(err);
             return TRUE;
         }
-        if (be->open("jackdaw", &cbs, NULL, err, sizeof err) != 0) {
-            jackdaw_error(err[0] ? err : "Could not open the audio system.");
-            be = NULL;
-            return TRUE;
-        }
+        g_strlcpy(eng_backend_key, key, sizeof eng_backend_key);
     }
 
     /* Query JACK's actual sample rate and buffer size */
@@ -2291,6 +2334,16 @@ void jackdaw_engine_quit(void)
 gboolean jackdaw_engine_is_running(void)
 {
     return engine.active;
+}
+
+const char *jackdaw_engine_get_backend(void)
+{
+    return eng_backend_key[0] ? eng_backend_key : NULL;
+}
+
+const char *jackdaw_engine_get_backend_notice(void)
+{
+    return eng_backend_notice;
 }
 
 gboolean jackdaw_engine_is_recording(void)

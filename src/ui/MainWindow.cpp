@@ -20,6 +20,7 @@
 #include <TextView.h>
 
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 #include "engine/jackdaw-engine.h"
@@ -252,7 +253,8 @@ MainWindow::MainWindow(JackDawProject *project)
       m_midictl_window(NULL), m_midictl_tick(NULL), m_mixer(NULL), m_mixer_item(NULL),
       m_mixer_window(NULL), m_mixer_visible(false), m_dock_h_applied(0.0f), m_load_panel(NULL),
       m_save_panel(NULL), m_open_panel(NULL), m_pending_action(PENDING_NONE),
-      m_pending_save_as(false), m_quit_confirmed(false), m_render_window(NULL),
+      m_pending_save_as(false), m_quit_confirmed(false), m_backend_mediakit(NULL),
+      m_backend_jack(NULL), m_render_window(NULL),
       m_render_thread(NULL), m_render_tick(NULL), m_render_method(RENDER_METHOD_OFFLINE),
       m_render_active(false), m_track_added_h(0), m_track_removed_h(0), m_tracks_reordered_h(0)
 {
@@ -468,6 +470,19 @@ BMenuBar *MainWindow::BuildMenuBar()
     AddItem(options, "Inputs/Outputs…", MSG_OPT_IO);
     AddItem(options, "Rescan Plugins", MSG_OPT_PLUGINS);
     AddItem(options, "MIDI Control…", MSG_OPT_MIDI_CONTROL);
+    options->AddSeparatorItem();
+    // Audio System — which backend the engine runs on. The engine opens it
+    // once at startup (ports, routes and plug-ins are set up for its rate and
+    // period), so a change restarts JackDAW with the same project.
+    BMenu *audio = new BMenu("Audio System");
+    audio->SetRadioMode(true);
+    BMessage *mk = new BMessage(MSG_OPT_BACKEND);
+    mk->AddString("backend", "mediakit");
+    audio->AddItem(m_backend_mediakit = new BMenuItem("Media Kit", mk));
+    BMessage *jk = new BMessage(MSG_OPT_BACKEND);
+    jk->AddString("backend", "jack");
+    audio->AddItem(m_backend_jack = new BMenuItem("JACK", jk));
+    options->AddItem(audio);
     bar->AddItem(options);
 
     return bar;
@@ -757,6 +772,22 @@ void MainWindow::RunPendingAction()
             BString path(m_pending_open_path);
             m_pending_open_path = "";
             OpenProject(path.String());
+            break;
+        }
+        case PENDING_RESTART: {
+            // Saved first, so the new instance reads it; it reopens the
+            // project's file as last saved (unsaved changes were declined).
+            settings_set_string("audioBackend", m_restart_backend.String());
+            settings_save();
+            BMessage restart(MSG_APP_RESTART);
+            const gchar *file = jackdaw_project_get_file(m_project);
+            if (file && *file)
+                restart.AddString("path", file);
+            // Reaches the application before the B_QUIT_REQUESTED that
+            // QuitRequested posts to it (one port, in order).
+            be_app->PostMessage(&restart);
+            m_quit_confirmed = true;
+            PostMessage(B_QUIT_REQUESTED);
             break;
         }
         default:
@@ -1540,6 +1571,34 @@ void MainWindow::MessageReceived(BMessage *message)
         case MSG_OPT_MIDI_CONTROL:
             OpenMidiControlWindow();
             break;
+        case MSG_OPT_BACKEND: {
+            const char *want = message->GetString("backend", "");
+            if (strcmp(want, "mediakit") != 0 && strcmp(want, "jack") != 0)
+                break;
+            const char *have = jackdaw_engine_get_backend();
+            if (have && strcmp(have, want) == 0)
+                break; // already on it
+            m_restart_backend = want;
+            BString question("JackDAW restarts to use ");
+            question << (strcmp(want, "jack") == 0 ? "JACK" : "the Media Kit")
+                     << ". Save changes first?";
+            ConfirmSaveThen(PENDING_RESTART, question.String());
+            break;
+        }
+        case MSG_OPEN_PROJECT_PATH: {
+            // A project named at launch (a restart onto another audio system,
+            // or `JackDAW file.jdaw`).
+            const char *path = message->GetString("path", NULL);
+            if (!path || !*path)
+                break;
+            if (message->GetBool("ask", false)) {
+                m_pending_open_path = path;
+                ConfirmSaveThen(PENDING_OPEN, "Save changes before opening another project?");
+            } else {
+                OpenProject(path);
+            }
+            break;
+        }
 
         // Control-surface poll tick: drain control_in and dispatch mappings.
         case MSG_MIDICTL_POLL:
@@ -1783,6 +1842,26 @@ void MainWindow::MessageReceived(BMessage *message)
             BWindow::MessageReceived(message);
             break;
     }
+}
+
+void MainWindow::MenusBeginning()
+{
+    // Mark the backend in use; when none opened, the one that will be tried
+    // next start. A cancelled restart prompt leaves the radio mark on the item
+    // clicked, so this is set each time the menus open.
+    const char *key = jackdaw_engine_get_backend();
+    gchar *saved = NULL;
+    if (!key) {
+        saved = settings_get_string("audioBackend", "mediakit");
+        key = saved;
+    }
+    const bool jack = strcmp(key, "jack") == 0;
+    if (m_backend_mediakit)
+        m_backend_mediakit->SetMarked(!jack);
+    if (m_backend_jack)
+        m_backend_jack->SetMarked(jack);
+    g_free(saved);
+    BWindow::MenusBeginning();
 }
 
 bool MainWindow::QuitRequested()

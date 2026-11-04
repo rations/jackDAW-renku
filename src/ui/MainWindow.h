@@ -11,6 +11,7 @@
 class BFilePanel;
 class BLayoutItem;
 class BMenuBar;
+class BMenuItem;
 class BMessageRunner;
 class BPoint;
 class CountInWindow;
@@ -32,6 +33,7 @@ public:
     ~MainWindow() override;
 
     void MessageReceived(BMessage *message) override;
+    void MenusBeginning() override;
     bool QuitRequested() override;
 
     // Rebuild both mixers' channel strips (called from GObject track-list
@@ -148,11 +150,16 @@ private:
     BFilePanel *m_open_panel; // "Open Project" open panel (lazy)
 
     // Save-before-replacing prompt state (see ConfirmSaveThen).
-    enum { PENDING_NONE = 0, PENDING_QUIT, PENDING_NEW, PENDING_OPEN };
+    enum { PENDING_NONE = 0, PENDING_QUIT, PENDING_NEW, PENDING_OPEN, PENDING_RESTART };
     int m_pending_action;        // waiting on the prompt or its Save As
     bool m_pending_save_as;      // the Save As panel is open for m_pending_action
     bool m_quit_confirmed;       // QuitRequested may go ahead without asking
     BString m_pending_open_path; // PENDING_OPEN: the project chosen
+    BString m_restart_backend;   // PENDING_RESTART: "mediakit" | "jack"
+
+    // Options -> Audio System items, marked by MenusBeginning.
+    BMenuItem *m_backend_mediakit;
+    BMenuItem *m_backend_jack;
 
     RenderWindow *m_render_window; // render/export dialog (NULL until opened)
 

@@ -1,12 +1,13 @@
 name			jackdaw
 version			@VERSION@-@REVISION@
 architecture	x86_64
-summary			"JackDAW - multitrack JACK DAW (native Haiku)"
+summary			"JackDAW - multitrack DAW on the Media Kit or JACK"
 description		"A native Haiku multitrack digital audio workstation built on the
 Interface Kit: audio and MIDI tracks, a piano-roll editor, a mixer, VST3 and LV2 effects,
 VST3 instruments, MIDI control-surface mapping, project save/load, and offline/realtime
 render. Plug-in editors are embedded natively in the FX window when a plug-in provides
-one. A JACK client - run the jack server first; VST3 plug-ins such as NAMku and DRUMku
+one. Runs on the RenkuOS media services (Media Kit, routed in Cortex, MIDI in PatchBay)
+or as a JACK client: choose in Options > Audio System. VST3 plug-ins such as NAMku and DRUMku
 are picked up from the system and user add-ons/vst3 directories, and LV2 plug-ins such
 as hktuner from the add-ons/lv2 directories on LV2_PATH."
 packager		"rations <ehqcar@proton.me>"

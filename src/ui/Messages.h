@@ -75,6 +75,7 @@ enum {
     MSG_FILE_NEW = 'fnew',
     MSG_OPEN_PROJECT_REFS = 'popn', // refs from the Open-Project panel (vs. load-file)
     MSG_CONFIRM_SAVE = 'cfsv',      // save-before prompt reply: int32 "which" 0 Cancel, 1 No, 2 Yes
+    MSG_OPEN_PROJECT_PATH = 'ppth', // from JackDawApp: string "path" given at launch
     // (Quit uses B_QUIT_REQUESTED.)
 
     // Menu bar — Edit.
@@ -113,6 +114,11 @@ enum {
     MSG_OPT_IO_APPLY = 'ioap', // from IoWindow: int32 "inputs"/"outputs" port counts
     MSG_OPT_PLUGINS = 'oplg',
     MSG_OPT_MIDI_CONTROL = 'omid',
+    MSG_OPT_BACKEND = 'obke', // Audio System item: string "backend" "mediakit" | "jack"
+
+    // To JackDawApp: start JackDAW again once it has quit; string "path" =
+    // the project to reopen (may be absent).
+    MSG_APP_RESTART = 'arst',
 
     // MIDI control surface (Options -> MIDI Control). The mapping table + engine
     // control_in live on the MainWindow looper (single mutator); the dialog runs

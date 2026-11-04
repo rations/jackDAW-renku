@@ -55,6 +55,17 @@ void jackdaw_engine_quit(void);
 /* Returns TRUE if the JACK client is currently active. */
 gboolean jackdaw_engine_is_running(void);
 
+/* The audio backend jackdaw_engine_init opened: "mediakit" or "jack", NULL
+ * when none opened. It is chosen by $JACKDAW_BACKEND, else the "audioBackend"
+ * setting, else "mediakit"; a JACK that cannot be opened falls back to the
+ * Media Kit. */
+const char *jackdaw_engine_get_backend(void);
+
+/* Why the engine is not on the backend that was chosen (the JACK fallback),
+ * or that it runs without audio; NULL when all is as chosen. Owned by the
+ * engine. */
+const char *jackdaw_engine_get_backend_notice(void);
+
 /* Returns TRUE while ENGINE_RECORDING flag is set. */
 gboolean jackdaw_engine_is_recording(void);
 
