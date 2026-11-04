@@ -118,6 +118,7 @@
 #include <OS.h>
 #include <TimeSource.h>
 
+#include <algorithm>
 #include <atomic>
 #include <math.h>
 #include <new>
@@ -1728,6 +1729,8 @@ struct CaptureSource {
 /* Hardware capture channels (every audio output of every physical-input
  * node), and the channels of inputs patched into JackDAW from elsewhere.
  * Non-RT. */
+int32 find_input_from(const media_source &source);
+
 void list_capture_sources(std::vector<CaptureSource> &out)
 {
     BMediaRoster *roster = BMediaRoster::CurrentRoster();
@@ -1739,11 +1742,48 @@ void list_capture_sources(std::vector<CaptureSource> &out)
         for (int32 n = 0; n < count; n++) {
             if (nodes[n].node.node == gNode->ID())
                 continue;
-            media_output outs[16];
+            std::vector<media_output> outs(32);
             int32 nouts = 0;
-            if (roster->GetAllOutputsFor(nodes[n].node, outs, 16, &nouts) != B_OK)
+            status_t err;
+            // It fills at most the given count and says how many it filled,
+            // so a full buffer may mean more.
+            while ((err = roster->GetAllOutputsFor(nodes[n].node, outs.data(), (int32)outs.size(),
+                                                   &nouts)) == B_OK &&
+                   nouts >= (int32)outs.size() && outs.size() < 4096)
+                outs.resize(outs.size() * 2);
+            if (err != B_OK)
                 continue;
-            for (int32 o = 0; o < nouts; o++) {
+            nouts = std::min(nouts, (int32)outs.size());
+
+            // A node may offer an output again for each connection, under
+            // the same name (multi_audio with a jack per channel does). List
+            // each name once: the one connected to us, else a free one, so
+            // the name a track keeps always means one output.
+            std::vector<int32> chosen;
+            {
+                BAutolock lock(gNode->fInputLock);
+                for (int32 o = 0; o < nouts; o++) {
+                    size_t c = 0;
+                    while (c < chosen.size() &&
+                           strncmp(outs[chosen[c]].name, outs[o].name, B_MEDIA_NAME_LENGTH) != 0)
+                        c++;
+                    if (c == chosen.size()) {
+                        chosen.push_back(o);
+                        continue;
+                    }
+                    const media_output &had = outs[chosen[c]];
+                    bool hadOurs = find_input_from(had.source) >= 0;
+                    bool hadFree = had.destination == media_destination::null;
+                    if (hadOurs)
+                        continue;
+                    if (find_input_from(outs[o].source) >= 0 ||
+                        (!hadFree && outs[o].destination == media_destination::null))
+                        chosen[c] = o;
+                }
+            }
+
+            for (size_t k = 0; k < chosen.size(); k++) {
+                int32 o = chosen[k];
                 const media_format &f = outs[o].format;
                 if (f.type != B_MEDIA_RAW_AUDIO && f.type != B_MEDIA_UNKNOWN_TYPE)
                     continue;
