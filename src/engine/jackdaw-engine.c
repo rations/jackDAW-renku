@@ -1769,12 +1769,17 @@ static int engine_process(jd_nframes_t nframes, void *arg)
             g_atomic_int_set(&engine.render_done, 1);
     }
 
-    /* Copy the master mix to the output ports */
+    /* Copy the master mix to out_1/out_2; the other outputs stay silent (the
+     * master is stereo, nothing else is routed to them yet). */
     for (i = 0; i < engine.audio_out_count; i++) {
         if (!engine.audio_out[i])
             continue;
         port_buf = be->port_buffer(engine.audio_out[i], nframes);
-        memcpy(port_buf, (i == 0) ? engine.master_L : engine.master_R, nframes * sizeof(float));
+        if (i < 2)
+            memcpy(port_buf, (i == 0) ? engine.master_L : engine.master_R,
+                   nframes * sizeof(float));
+        else
+            memset(port_buf, 0, nframes * sizeof(float));
     }
 
     /* Instrument-track MIDI output: clear every per-slot midi_out, then write
