@@ -11,17 +11,23 @@
  * mono ports that it reads and writes each cycle, connected by name. Here a
  * port is a mono buffer owned by the backend, and media connections carry
  * several channels each.
- *  - Outputs: the engine's out_1/out_2 make the stereo jack "Master", out_3/
- *    out_4 "Out 3+4" and so on, and "metronome" the mono jack "Metronome".
- *    A media output connects to exactly one input, so every jack always
- *    offers one more free output: the same mix can feed the system mixer and
- *    a hardware input at once.
- *  - Inputs: the node always offers a free input, and each connection to it
- *    (from a hardware capture output, or anything else patched in Cortex)
- *    becomes a numbered input with its own FIFO. The engine's capture ports
- *    (in_N) read one channel of one input each. The engine's connect(source,
- *    in_N) makes the media connection when needed and then routes the chosen
- *    channel, which is what jack_connect does for JACK.
+ *  - Outputs: as with JACK, every output port is a jack of its own: out_N
+ *    is the mono jack "Out N", and "metronome" the mono jack "Metronome".
+ *    out_1/out_2 also make the stereo jack "Master", which goes to the
+ *    system mixer. A media output connects to exactly one input, so every
+ *    jack always offers one more free output: the same signal can feed the
+ *    system mixer and a hardware input at once.
+ *  - Inputs: as with JACK, every capture port is a jack of its own: in_N is
+ *    "In N" (in_NR, a stereo track's right side, "In NR"). Each always
+ *    offers a free jack, and each connection made on it (from a hardware
+ *    capture output, or anything patched in a patchbay) becomes an input
+ *    with its own FIFO that feeds that port; several add up, as in JACK. A
+ *    connection with more channels than one feeds the port one of them.
+ *    The engine's connect(source, in_N) makes that connection on in_N's
+ *    jack (from another output of the same name when the first is in use,
+ *    as multi_audio offers), and disconnect undoes it, which is what
+ *    jack_connect and jack_disconnect do. Only an output that can come in
+ *    once and already does is read where it comes in (a route).
  *  - The master auto-connects to the system mixer when the node starts, like
  *    MediaPlayer's audio producer, so JackDAW is heard alongside other apps.
  *
@@ -135,9 +141,13 @@ namespace
 {
 
 const int32 kMaxPorts = 256;
-const int32 kMaxJacks = 34;      // Master, Out 3+4 ... Out 63+64, Metronome
-const int32 kMaxOutConns = 8;    // connections per jack
-const int32 kMaxInputs = 16;     // input connections
+const int32 kMaxOutPorts = 64;              // out_1 .. out_64, as JACKDAW_MAX_TRACKS
+const int32 kMaxJacks = kMaxOutPorts + 2;   // Master, Out 1 ... Out 64, Metronome
+const int32 kMaxOutConns = 8;               // connections per jack
+const int32 kMaxInputs = 128;               // input connections (a route keeps 8 bits)
+// The free input jack of capture port slot p has destination id
+// kFreeJackBase + p; a connection made on it gets the id of its Input.
+const int32 kFreeJackBase = 0x10000;
 const int32 kMaxInChannels = 64; // channels per input connection
 const int32 kMidiMaxEvents = 256;
 const int32 kMetronomeJack = kMaxJacks - 1;
@@ -300,6 +310,11 @@ struct Jack {
 
 struct Input {
     bool connected = false;
+    // The capture port (slot) whose jack this connection was made on, which
+    // it feeds, and which of its channels; -1 for none. Set on the control
+    // thread (Connected), the channel also by connect() under fInputLock.
+    std::atomic<int32> port{-1};
+    std::atomic<int32> channel{0};
     uint8 generation = 0;
     bool madeByUs = false;   // connect() made it; disconnect may undo it
     media_node producerNode; // valid when madeByUs
@@ -483,6 +498,7 @@ protected:
 private:
     OutConn *_FindOutput(const media_source &source, int32 *jackIndex = NULL);
     Input *_FindInput(const media_destination &dest);
+    int32 _FreeJackPort(const media_destination &dest) const;
     void _UpdateLatency();
     void _RunCycle(bigtime_t performanceTime, bigtime_t lateness);
     void _FillInputs(bigtime_t performanceTime);
@@ -662,7 +678,6 @@ void JdMediaNode::NodeRegistered()
         in.format.type = B_MEDIA_RAW_AUDIO;
         in.format.u.raw_audio = media_raw_audio_format::wildcard;
         in.format.u.raw_audio.frame_rate = fRate;
-        snprintf(in.name, sizeof in.name, "In %" B_PRId32, i + 1);
     }
     SetBufferDuration((bigtime_t)(1000000.0 * fPeriod / fRate));
     SetEventLatency(fInternalLatency);
@@ -687,6 +702,31 @@ Input *JdMediaNode::_FindInput(const media_destination &dest)
     if (dest.port != ControlPort() || dest.id < 0 || dest.id >= kMaxInputs)
         return NULL;
     return &fInputs[dest.id];
+}
+
+/* The capture port slot whose free jack \a dest is, or -1. */
+int32 JdMediaNode::_FreeJackPort(const media_destination &dest) const
+{
+    if (dest.port != ControlPort() || dest.id < kFreeJackBase || dest.id >= kFreeJackBase + kMaxPorts)
+        return -1;
+    int32 p = dest.id - kFreeJackBase;
+    const Port &port = fPorts[p];
+    if (!port.used.load(std::memory_order_acquire) || port.type != JD_PORT_AUDIO ||
+        port.direction != JD_PORT_INPUT)
+        return -1;
+    return p;
+}
+
+/* A capture port's jack name, as JACK's port names read: in_3 -> "In 3",
+ * in_3R -> "In 3R"; any other name as it is. */
+void input_jack_name(const Port &port, char *name, size_t size)
+{
+    unsigned n;
+    char tail[8] = "";
+    if (sscanf(port.shortName, "in_%u%7s", &n, tail) >= 1)
+        snprintf(name, size, "In %u%s", n, tail);
+    else
+        snprintf(name, size, "%s", port.shortName);
 }
 
 void JdMediaNode::_UpdateLatency()
@@ -715,8 +755,7 @@ void JdMediaNode::_UpdateLatency()
 
 status_t JdMediaNode::AcceptFormat(const media_destination &dest, media_format *format)
 {
-    Input *in = _FindInput(dest);
-    if (!in || in->connected)
+    if (_FreeJackPort(dest) < 0)
         return B_MEDIA_BAD_DESTINATION;
     if (format->type == B_MEDIA_UNKNOWN_TYPE)
         format->type = B_MEDIA_RAW_AUDIO;
@@ -728,8 +767,10 @@ status_t JdMediaNode::AcceptFormat(const media_destination &dest, media_format *
         a.frame_rate = fRate;
     if (fabsf(a.frame_rate - fRate) > 0.5f)
         return B_MEDIA_BAD_FORMAT;
+    // A jack is one port, as in JACK; a connection with more channels feeds
+    // it one of them (the first, or the one connect() chose).
     if (a.channel_count == w.channel_count)
-        a.channel_count = 2;
+        a.channel_count = 1;
     if (a.channel_count < 1 || a.channel_count > (uint32)kMaxInChannels)
         return B_MEDIA_BAD_FORMAT;
     if (a.format == w.format)
@@ -747,17 +788,32 @@ status_t JdMediaNode::AcceptFormat(const media_destination &dest, media_format *
 
 status_t JdMediaNode::GetNextInput(int32 *cookie, media_input *input)
 {
-    // Every connected input, then one free input.
+    // Every connection, under the name of the jack it was made on, then one
+    // free jack for every capture port (the engine's in_N, JACK's ports), so
+    // each port takes any number of connections; they add up.
     int32 seen = 0;
-    bool freeListed = false;
     for (int32 i = 0; i < kMaxInputs; i++) {
-        bool list = fInputs[i].connected || !freeListed;
-        if (!list)
-            continue;
         if (!fInputs[i].connected)
-            freeListed = true;
+            continue;
         if (seen++ == *cookie) {
             *input = fInputs[i].input;
+            *cookie += 1;
+            return B_OK;
+        }
+    }
+    for (int32 p = 0; p < kMaxPorts; p++) {
+        media_destination dest(ControlPort(), kFreeJackBase + p);
+        if (_FreeJackPort(dest) < 0)
+            continue;
+        if (seen++ == *cookie) {
+            input->node = Node();
+            input->source = media_source::null;
+            input->destination = dest;
+            input->format.type = B_MEDIA_RAW_AUDIO;
+            input->format.u.raw_audio = media_raw_audio_format::wildcard;
+            input->format.u.raw_audio.frame_rate = fRate;
+            input->format.u.raw_audio.channel_count = 1;
+            input_jack_name(fPorts[p], input->name, sizeof input->name);
             *cookie += 1;
             return B_OK;
         }
@@ -772,8 +828,19 @@ void JdMediaNode::DisposeInputCookie(int32 /*cookie*/)
 status_t JdMediaNode::Connected(const media_source &producer, const media_destination &where,
                                 const media_format &format, media_input *input)
 {
-    Input *in = _FindInput(where);
-    if (!in || in->connected)
+    // Made on a port's free jack: it becomes an input of its own (the roster
+    // takes the destination we return), feeding that port.
+    int32 p = _FreeJackPort(where);
+    if (p < 0)
+        return B_MEDIA_BAD_DESTINATION;
+    Input *in = NULL;
+    {
+        BAutolock lock(fInputLock);
+        for (int32 i = 0; i < kMaxInputs && !in; i++)
+            if (!fInputs[i].connected)
+                in = &fInputs[i];
+    }
+    if (!in)
         return B_MEDIA_BAD_DESTINATION;
     int32 ch = (int32)format.u.raw_audio.channel_count;
     if (ch < 1 || ch > kMaxInChannels)
@@ -806,6 +873,9 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
     in->latencyFrames.store(0);
     in->input.source = producer;
     in->input.format = format;
+    input_jack_name(fPorts[p], in->input.name, sizeof in->input.name);
+    in->channel.store(0, std::memory_order_relaxed);
+    in->port.store(p, std::memory_order_release);
     in->generation++;
     in->connected = true;
     _DiagForgetCapture(int32(in - fInputs));
@@ -820,6 +890,7 @@ void JdMediaNode::Disconnected(const media_source &producer, const media_destina
         return;
     BAutolock lock(fInputLock);
     in->connected = false;
+    in->port.store(-1, std::memory_order_release);
     in->generation++; // routes to it go silent
     in->madeByUs = false;
     _DiagForgetCapture(int32(in - fInputs));
@@ -916,7 +987,8 @@ void JdMediaNode::ProducerDataStatus(const media_destination & /*dest*/, int32 /
 status_t JdMediaNode::GetLatencyFor(const media_destination &dest, bigtime_t *latency,
                                     media_node_id *timeSource)
 {
-    if (!_FindInput(dest))
+    // A producer may ask about a free jack before it connects to it.
+    if (!_FindInput(dest) && _FreeJackPort(dest) < 0)
         return B_MEDIA_BAD_DESTINATION;
     *latency = EventLatency();
     *timeSource = TimeSource()->ID();
@@ -1547,6 +1619,25 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
         else
             memset(port.audio, 0, sizeof(float) * fPeriod);
     }
+
+    // And every connection made on a port's jack adds its channel to that
+    // port: several sum, as in JACK.
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        const Input &in = fInputs[i];
+        int32 p = in.port.load(std::memory_order_acquire);
+        if (!in.connected || p < 0 || p >= kMaxPorts)
+            continue;
+        Port &port = fPorts[p];
+        if (!port.used.load(std::memory_order_acquire) || port.type != JD_PORT_AUDIO ||
+            port.direction != JD_PORT_INPUT)
+            continue;
+        int32 ch = in.channel.load(std::memory_order_relaxed);
+        if (ch < 0 || ch >= in.channels)
+            ch = 0;
+        const float *src = in.scratch + ch * fPeriod;
+        for (int32 f = 0; f < fPeriod; f++)
+            port.audio[f] += src[f];
+    }
 }
 
 /* This cycle's MIDI input for one port: the events that arrived in the
@@ -1678,25 +1769,29 @@ void JdMediaNode::_SendOutputs(bigtime_t performanceTime)
 
 // ---- jacks for output ports ----
 
-/* Which jack and channel an output port feeds, from its name: out_N -> jack
- * (N-1)/2 channel (N-1)%2 ("Master" for out_1/out_2), "metronome" -> the
- * Metronome jack. Other names have no jack. */
-bool jack_for_port(const char *shortName, int32 *jack, int32 *channel)
+/* The jacks and channels an output port feeds, from its name; returns how
+ * many (up to 2). out_N -> the mono jack "Out N" (jack N), as JACK's port,
+ * and out_1/out_2 also -> the stereo "Master" (jack 0) that goes to the
+ * system mixer; "metronome" -> the Metronome jack. Other names feed none. */
+int32 jacks_for_port(const char *shortName, int32 jack[2], int32 channel[2])
 {
     unsigned n;
     char tail;
-    if (sscanf(shortName, "out_%u%c", &n, &tail) == 1 && n >= 1 &&
-        (n - 1) / 2 < (unsigned)kMetronomeJack) {
-        *jack = (int32)((n - 1) / 2);
-        *channel = (int32)((n - 1) % 2);
-        return true;
+    if (sscanf(shortName, "out_%u%c", &n, &tail) == 1 && n >= 1 && n <= (unsigned)kMaxOutPorts) {
+        jack[0] = (int32)n;
+        channel[0] = 0;
+        if (n > 2)
+            return 1;
+        jack[1] = 0;
+        channel[1] = (int32)n - 1;
+        return 2;
     }
     if (strcmp(shortName, "metronome") == 0) {
-        *jack = kMetronomeJack;
-        *channel = 0;
-        return true;
+        jack[0] = kMetronomeJack;
+        channel[0] = 0;
+        return 1;
     }
-    return false;
+    return 0;
 }
 
 void setup_jacks(JdMediaNode *node)
@@ -1710,8 +1805,8 @@ void setup_jacks(JdMediaNode *node)
             snprintf(jk.name, sizeof jk.name, "Master");
             jk.channels = 2;
         } else {
-            snprintf(jk.name, sizeof jk.name, "Out %d+%d", (int)(2 * j + 1), (int)(2 * j + 2));
-            jk.channels = 2;
+            snprintf(jk.name, sizeof jk.name, "Out %d", (int)j);
+            jk.channels = 1;
         }
     }
 }
@@ -1921,9 +2016,9 @@ void release_dead_capture_connections(BMediaRoster *roster)
 /* Connect one of our jacks' free outputs to a free input of `consumer`. */
 status_t connect_jack(BMediaRoster *roster, int32 jack, const media_node &consumer)
 {
-    media_output outs[kMaxJacks * kMaxOutConns];
+    std::vector<media_output> outs(kMaxJacks * kMaxOutConns);
     int32 n = 0;
-    if (roster->GetFreeOutputsFor(gNode->Node(), outs, kMaxJacks * kMaxOutConns, &n) != B_OK)
+    if (roster->GetFreeOutputsFor(gNode->Node(), outs.data(), (int32)outs.size(), &n) != B_OK)
         return B_ERROR;
     const media_output *free = NULL;
     for (int32 i = 0; i < n && !free; i++)
@@ -2220,9 +2315,9 @@ void mk_close(void)
         roster->StopNode(gNode->Node(), 0, true);
 
         // Disconnect wants both node ids; a connection only names ports.
-        media_output outs[kMaxJacks * kMaxOutConns];
+        std::vector<media_output> outs(kMaxJacks * kMaxOutConns);
         int32 n = 0;
-        if (roster->GetConnectedOutputsFor(gNode->Node(), outs, kMaxJacks * kMaxOutConns, &n) ==
+        if (roster->GetConnectedOutputsFor(gNode->Node(), outs.data(), (int32)outs.size(), &n) ==
             B_OK) {
             for (int32 i = 0; i < n; i++) {
                 media_node_id consumer = node_for_port(roster, outs[i].destination.port);
@@ -2230,9 +2325,10 @@ void mk_close(void)
                     roster->Disconnect(gNode->ID(), outs[i].source, consumer, outs[i].destination);
             }
         }
-        media_input ins[kMaxInputs];
+        std::vector<media_input> ins(kMaxInputs);
         n = 0;
-        if (roster->GetConnectedInputsFor(gNode->Node(), ins, kMaxInputs, &n) == B_OK) {
+        if (roster->GetConnectedInputsFor(gNode->Node(), ins.data(), (int32)ins.size(), &n) ==
+            B_OK) {
             for (int32 i = 0; i < n; i++) {
                 media_node_id producer = node_for_port(roster, ins[i].source.port);
                 if (producer > 0)
@@ -2287,6 +2383,78 @@ jd_nframes_t mk_buffer_size(void)
     return gNode ? (jd_nframes_t)gNode->Period() : 0;
 }
 
+/* The capture-source names (as list_capture_sources gives them) that the
+ * connection \a in carries into its port: "<prefix><node> / <output> / <n>"
+ * for the channel it feeds, and the form used for a connection from a node
+ * that is not hardware. Non-RT. */
+void input_source_names(BMediaRoster *roster, const media_source &source, const char *jackName,
+                        int32 channel, char *hardware, char *other, size_t size)
+{
+    snprintf(other, size, "%s%s %s / %d", kCapturePrefix, gNodeName, jackName, (int)(channel + 1));
+    hardware[0] = '\0';
+    media_node_id id = node_for_port(roster, source.port);
+    media_node node;
+    if (id < 0 || roster->GetNodeFor(id, &node) != B_OK)
+        return;
+    live_node_info info;
+    std::vector<media_output> outs(64);
+    int32 n = 0;
+    if (roster->GetLiveNodeInfo(node, &info) == B_OK &&
+        roster->GetConnectedOutputsFor(node, outs.data(), (int32)outs.size(), &n) == B_OK) {
+        for (int32 o = 0; o < n && o < (int32)outs.size(); o++) {
+            if (outs[o].source == source) {
+                snprintf(hardware, size, "%s%s / %s / %d", kCapturePrefix, info.name, outs[o].name,
+                         (int)(channel + 1));
+                break;
+            }
+        }
+    }
+    roster->ReleaseNode(node);
+}
+
+/* Disconnects the connections made on capture port \a p's jack: all of
+ * them, or those that carry \a sourceName. Non-RT; not under fInputLock (our
+ * own Disconnected takes it on the control thread). */
+void disconnect_port_inputs(int32 p, const char *sourceName)
+{
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!gNode || !roster)
+        return;
+    struct Conn {
+        media_source source;
+        media_destination destination;
+        char jackName[B_MEDIA_NAME_LENGTH];
+        int32 channel;
+    };
+    std::vector<Conn> conns;
+    {
+        BAutolock lock(gNode->fInputLock);
+        for (int32 i = 0; i < kMaxInputs; i++) {
+            const Input &in = gNode->fInputs[i];
+            if (!in.connected || in.port.load() != p)
+                continue;
+            Conn c;
+            c.source = in.input.source;
+            c.destination = in.input.destination;
+            strlcpy(c.jackName, in.input.name, sizeof c.jackName);
+            c.channel = in.channel.load();
+            conns.push_back(c);
+        }
+    }
+    for (size_t k = 0; k < conns.size(); k++) {
+        if (sourceName != NULL) {
+            char hardware[192], other[192];
+            input_source_names(roster, conns[k].source, conns[k].jackName, conns[k].channel,
+                               hardware, other, sizeof hardware);
+            if (strcmp(sourceName, hardware) != 0 && strcmp(sourceName, other) != 0)
+                continue;
+        }
+        media_node_id producer = node_for_port(roster, conns[k].source.port);
+        if (producer >= 0)
+            roster->Disconnect(producer, conns[k].source, gNode->ID(), conns[k].destination);
+    }
+}
+
 JdPort *mk_port_register(const char *shortName, int type, int direction)
 {
     if (!gNode || !shortName)
@@ -2338,11 +2506,13 @@ JdPort *mk_port_register(const char *shortName, int type, int direction)
         port.route.store(-1);
         port.used.store(1, std::memory_order_release);
 
-        int32 j, c;
-        if (type == JD_PORT_AUDIO && port.direction == JD_PORT_OUTPUT &&
-            jack_for_port(shortName, &j, &c)) {
-            gNode->fJacks[j].portSlot[c].store(p, std::memory_order_release);
-            gNode->fJacks[j].active.store(1, std::memory_order_release);
+        int32 j[2], c[2];
+        int32 n = type == JD_PORT_AUDIO && port.direction == JD_PORT_OUTPUT
+                      ? jacks_for_port(shortName, j, c)
+                      : 0;
+        for (int32 k = 0; k < n; k++) {
+            gNode->fJacks[j[k]].portSlot[c[k]].store(p, std::memory_order_release);
+            gNode->fJacks[j[k]].active.store(1, std::memory_order_release);
         }
         return (JdPort *)&port;
     }
@@ -2354,19 +2524,23 @@ void mk_port_unregister(JdPort *jp)
     Port *port = (Port *)jp;
     if (!gNode || !port)
         return;
-    int32 j, c;
-    if (port->type == JD_PORT_AUDIO && port->direction == JD_PORT_OUTPUT &&
-        jack_for_port(port->shortName, &j, &c)) {
-        Jack &jk = gNode->fJacks[j];
-        jk.portSlot[c].store(-1, std::memory_order_release);
-        // Jack 0 (Master) and the Metronome stay listed; extra jacks go away
-        // with their last port.
+    int32 j[2], c[2];
+    int32 n = port->type == JD_PORT_AUDIO && port->direction == JD_PORT_OUTPUT
+                  ? jacks_for_port(port->shortName, j, c)
+                  : 0;
+    for (int32 k = 0; k < n; k++) {
+        Jack &jk = gNode->fJacks[j[k]];
+        jk.portSlot[c[k]].store(-1, std::memory_order_release);
+        // Jack 0 (Master) and the Metronome stay listed; the others go away
+        // with their port.
         bool any = false;
-        for (int32 k = 0; k < jk.channels; k++)
-            any |= jk.portSlot[k].load() >= 0;
-        if (!any && j != 0 && j != kMetronomeJack)
+        for (int32 ch = 0; ch < jk.channels; ch++)
+            any |= jk.portSlot[ch].load() >= 0;
+        if (!any && j[k] != 0 && j[k] != kMetronomeJack)
             jk.active.store(0, std::memory_order_release);
     }
+    if (port->type == JD_PORT_AUDIO && port->direction == JD_PORT_INPUT)
+        disconnect_port_inputs(int32(port - gNode->fPorts), NULL);
     port->route.store(-1, std::memory_order_release);
     if (port->type == JD_PORT_MIDI) {
         midi_disconnect_all(*port);
@@ -2393,13 +2567,18 @@ jd_nframes_t mk_port_capture_latency(JdPort *jp)
         int32 frames = gNode->fMidiDelayFrames.load(std::memory_order_relaxed);
         return port->direction == JD_PORT_INPUT && frames > 0 ? (jd_nframes_t)frames : 0;
     }
+    // The largest of what it reads: its route and the connections on its jack.
+    int32 frames = 0;
     int32 r = port->route.load(std::memory_order_acquire);
-    if (r < 0)
-        return 0;
     int32 i = (r >> 8) & 0xff;
-    if (i >= kMaxInputs)
-        return 0;
-    int32 frames = gNode->fInputs[i].latencyFrames.load(std::memory_order_relaxed);
+    if (r >= 0 && i < kMaxInputs)
+        frames = gNode->fInputs[i].latencyFrames.load(std::memory_order_relaxed);
+    int32 p = int32(port - gNode->fPorts);
+    for (int32 k = 0; k < kMaxInputs; k++) {
+        const Input &in = gNode->fInputs[k];
+        if (in.connected && in.port.load(std::memory_order_acquire) == p)
+            frames = std::max(frames, in.latencyFrames.load(std::memory_order_relaxed));
+    }
     return frames > 0 ? (jd_nframes_t)frames : 0;
 }
 
@@ -2558,6 +2737,7 @@ int mk_connect(const char *source, const char *destination)
                 destination ? destination : "(null)");
         return -1;
     }
+    int32 p = int32(port - gNode->fPorts);
     std::vector<CaptureSource> srcs;
     list_capture_sources(srcs);
     const CaptureSource *s = NULL;
@@ -2569,50 +2749,87 @@ int mk_connect(const char *source, const char *destination)
         return -1;
     }
 
-    int32 input = s->input;
-    if (input < 0) {
+    {
+        // Already wired to this port's jack: only the channel is chosen.
         BAutolock lock(gNode->fInputLock);
-        input = find_input_from(s->output.source);
+        for (int32 i = 0; i < kMaxInputs; i++) {
+            Input &in = gNode->fInputs[i];
+            if (!in.connected || in.port.load() != p)
+                continue;
+            if (s->input >= 0 ? i == s->input : in.input.source == s->output.source) {
+                if (s->channel >= in.channels)
+                    return -1;
+                in.channel.store(s->channel, std::memory_order_relaxed);
+                port->route.store(-1, std::memory_order_release);
+                return 0;
+            }
+        }
     }
-    if (input < 0) {
-        // Not connected to us yet: connect that whole output to our free input.
-        BMediaRoster *roster = BMediaRoster::CurrentRoster();
-        if (!roster)
-            return -1;
-        media_input free;
+
+    BMediaRoster *roster = BMediaRoster::CurrentRoster();
+    if (!roster)
+        return -1;
+
+    // A connection of its own on this port's jack, as JACK makes: from that
+    // output or, when it is in use (on another of our ports, or elsewhere),
+    // from another output of the same name that the node offers for each
+    // connection (multi_audio's jacks do).
+    media_output out = s->output;
+    bool own = s->input < 0;
+    if (own && out.destination != media_destination::null) {
+        own = false;
+        std::vector<media_output> frees(64);
         int32 n = 0;
-        if (roster->GetFreeInputsFor(gNode->Node(), &free, 1, &n, B_MEDIA_RAW_AUDIO) != B_OK ||
-            n < 1) {
-            fprintf(stderr, "%s media: connect %s: no free input\n", gNodeName, source);
-            return -1;
+        if (roster->GetFreeOutputsFor(s->node, frees.data(), (int32)frees.size(), &n,
+                                      B_MEDIA_RAW_AUDIO) == B_OK) {
+            for (int32 o = 0; o < n && o < (int32)frees.size() && !own; o++) {
+                if (strncmp(frees[o].name, out.name, B_MEDIA_NAME_LENGTH) == 0) {
+                    out = frees[o];
+                    own = true;
+                }
+            }
         }
-        media_format fmt;
-        fmt.type = B_MEDIA_RAW_AUDIO;
-        fmt.u.raw_audio = media_raw_audio_format::wildcard;
-        media_output madeOut;
-        media_input madeIn;
-        status_t err = roster->Connect(s->output.source, free.destination, &fmt, &madeOut, &madeIn);
-        if (err != B_OK) {
-            fprintf(stderr, "%s media: connecting %s to %s failed: %s\n", gNodeName, source,
-                    gNodeName, strerror(err));
-            return -1;
-        }
-        BAutolock lock(gNode->fInputLock);
-        input = find_input_from(madeOut.source);
-        if (input < 0)
-            return -1;
-        gNode->fInputs[input].madeByUs = true;
-        gNode->fInputs[input].producerNode = s->node;
     }
-    BAutolock lock(gNode->fInputLock);
-    const Input &in = gNode->fInputs[input];
-    if (!in.connected || s->channel >= in.channels) {
-        fprintf(stderr, "%s media: connect %s: input %d is %s with %d channels\n", gNodeName,
-                source, (int)input, in.connected ? "connected" : "not connected", (int)in.channels);
+    if (!own) {
+        // It comes in already and cannot come in again (an output a node
+        // offers once, or a connection from a node that is not hardware):
+        // the port reads its channel where it comes in.
+        BAutolock lock(gNode->fInputLock);
+        int32 input = s->input >= 0 ? s->input : find_input_from(s->output.source);
+        if (input < 0 || !gNode->fInputs[input].connected ||
+            s->channel >= gNode->fInputs[input].channels) {
+            fprintf(stderr, "%s media: connect %s: that output is connected elsewhere\n",
+                    gNodeName, source);
+            return -1;
+        }
+        port->route.store(((int32)gNode->fInputs[input].generation << 16) | (input << 8) |
+                              s->channel,
+                          std::memory_order_release);
+        return 0;
+    }
+
+    media_format fmt;
+    fmt.type = B_MEDIA_RAW_AUDIO;
+    fmt.u.raw_audio = media_raw_audio_format::wildcard;
+    media_output madeOut;
+    media_input madeIn;
+    media_destination jack(gNode->ControlPort(), kFreeJackBase + p);
+    status_t err = roster->Connect(out.source, jack, &fmt, &madeOut, &madeIn);
+    if (err != B_OK) {
+        fprintf(stderr, "%s media: connecting %s to %s failed: %s\n", gNodeName, source,
+                destination, strerror(err));
         return -1;
     }
-    port->route.store(((int32)in.generation << 16) | (input << 8) | s->channel,
-                      std::memory_order_release);
+    BAutolock lock(gNode->fInputLock);
+    int32 input = find_input_from(madeOut.source);
+    if (input < 0)
+        return -1;
+    Input &in = gNode->fInputs[input];
+    in.madeByUs = true;
+    in.producerNode = s->node;
+    if (s->channel < in.channels)
+        in.channel.store(s->channel, std::memory_order_relaxed);
+    port->route.store(-1, std::memory_order_release);
     return 0;
 }
 
@@ -2620,10 +2837,15 @@ int mk_disconnect(const char *source, const char *destination)
 {
     if (is_midi_port(source) || is_midi_port(destination))
         return midi_connect(source, destination, false) == -1 ? -1 : 0;
-    // A capture port reads one source, so the port says which.
     Port *port = port_by_full_name(destination);
     if (!port || port->direction != JD_PORT_INPUT)
         return -1;
+
+    // The connections made on this port's jack that carry it, whoever made
+    // them, as jack_disconnect does.
+    disconnect_port_inputs(int32(port - gNode->fPorts), source);
+
+    // A port that reads a channel where it comes in (see mk_connect).
     int32 r = port->route.exchange(-1, std::memory_order_acq_rel);
     if (r < 0)
         return 0;
@@ -2644,7 +2866,8 @@ int mk_disconnect(const char *source, const char *destination)
     {
         BAutolock lock(gNode->fInputLock);
         Input &in = gNode->fInputs[input];
-        if (stillUsed || !in.connected || !in.madeByUs)
+        // One made on a jack still feeds that jack's port.
+        if (stillUsed || !in.connected || !in.madeByUs || in.port.load() >= 0)
             return 0;
         src = in.input.source;
         dst = in.input.destination;
