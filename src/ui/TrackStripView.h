@@ -7,17 +7,16 @@
 #include "engine/track.h"
 
 class BButton;
-class BMenuField;
-class BPopUpMenu;
 class BTextControl;
 class KnobView;
+class PortSelector;
 class StateButton;
 class VuView;
 
 // One track's header strip (the 235 px column left of its timeline lane): name
 // entry; Arm/Mute/Solo/Mono-Stereo/Fx buttons (Fx opens the track's VST3 FX
 // chain window); trim (V) and pan (P) knobs; a JACK capture-port input
-// selector; and a stereo VU. It lives on the MainWindow looper, so it calls
+// selector (fixed width, the name shortened to fit); and a stereo VU. It lives on the MainWindow looper, so it calls
 // the track / engine API directly; structural actions (select, delete,
 // context menu) go to MainWindow. SyncFromTrack() re-reads engine state.
 class TrackStripView : public BView
@@ -58,8 +57,7 @@ private:
     StateButton *m_fx; // opens this track's FxWindow (blue when it carries a chain)
     KnobView *m_vol;   // trim (V)
     KnobView *m_pan;   // pan (P)
-    BMenuField *m_input_field;
-    BPopUpMenu *m_input_menu;
+    PortSelector *m_input;
     VuView *m_vu;
 
     gulong m_state_handler;   // track "state-changed" -> SyncFromTrack

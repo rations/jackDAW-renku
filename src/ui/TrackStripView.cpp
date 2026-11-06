@@ -4,10 +4,7 @@
 
 #include <Button.h>
 #include <LayoutBuilder.h>
-#include <MenuField.h>
-#include <MenuItem.h>
 #include <Message.h>
-#include <PopUpMenu.h>
 #include <TextControl.h>
 #include <Window.h>
 
@@ -19,6 +16,7 @@
 #include "engine/jackdaw-engine.h"
 #include "KnobView.h"
 #include "Messages.h"
+#include "PortSelector.h"
 #include "TimelineView.h"  // kTimelineTrackHeight (row geometry for the reorder drag)
 #include "TrackAreaView.h" // parent view: drop-indicator feedback
 #include "VuView.h"
@@ -44,19 +42,10 @@ enum {
     MSG_S_FX = 'sfx ',
 };
 
-// Short JACK port name (drop the "client:" prefix) for menu labels.
-static const char *port_short(const char *full)
-{
-    if (!full)
-        return "";
-    const char *colon = strrchr(full, ':');
-    return (colon && colon[1]) ? colon + 1 : full;
-}
-
 TrackStripView::TrackStripView(JackDawProject *project, JackDawTrack *track, const BMessenger &main)
     : BView("track_strip", B_WILL_DRAW | B_FRAME_EVENTS), m_project(project), m_track(track),
       m_main(main), m_name(NULL), m_arm(NULL), m_mute(NULL), m_solo(NULL), m_stereo(NULL),
-      m_fx(NULL), m_vol(NULL), m_pan(NULL), m_input_field(NULL), m_input_menu(NULL), m_vu(NULL),
+      m_fx(NULL), m_vol(NULL), m_pan(NULL), m_input(NULL), m_vu(NULL),
       m_state_handler(0), m_routing_handler(0), m_maybe_drag(false), m_did_drag(false),
       m_drag_start_y(0.0f), m_drag_from(-1)
 {
@@ -96,8 +85,7 @@ TrackStripView::TrackStripView(JackDawProject *project, JackDawTrack *track, con
                          KnobView::KIND_PAN, new BMessage(MSG_S_PAN));
     m_pan->SetCenterLabel("P");
 
-    m_input_menu = new BPopUpMenu("In");
-    m_input_field = new BMenuField("input", NULL, m_input_menu);
+    m_input = new PortSelector("input", new BMessage(MSG_S_INPUT));
 
     m_vu = new VuView("vu", 14.0f);
 
@@ -119,7 +107,7 @@ TrackStripView::TrackStripView(JackDawProject *project, JackDawTrack *track, con
         .AddGroup(B_HORIZONTAL, 3.0f)
         .Add(m_vol)
         .Add(m_pan)
-        .Add(m_input_field)
+        .Add(m_input)
         .End()
         .AddGlue()
         .End()
@@ -143,6 +131,7 @@ void TrackStripView::AttachedToWindow()
     m_fx->SetTarget(this);
     m_vol->SetTarget(this);
     m_pan->SetTarget(this);
+    m_input->SetTarget(this);
 
     BuildInputMenu();
     SyncFromTrack();
@@ -168,31 +157,14 @@ void TrackStripView::DetachedFromWindow()
 
 void TrackStripView::BuildInputMenu()
 {
-    // Rebuild the source list from the current physical JACK ports — audio
-    // capture ports for audio tracks, MIDI capture ports for instrument tracks.
-    while (m_input_menu->CountItems() > 0)
-        delete m_input_menu->RemoveItem((int32)0);
-
-    BMessage *none_msg = new BMessage(MSG_S_INPUT);
-    none_msg->AddString("port", "");
-    none_msg->AddInt32("index", -1);
-    BMenuItem *none = new BMenuItem("None", none_msg);
-    none->SetTarget(this);
-    m_input_menu->AddItem(none);
-
+    // The sources the selector offers: audio capture ports for audio tracks,
+    // MIDI capture ports for instrument tracks. The selector builds its pop-up
+    // from these when it opens.
     const char **ports = jackdaw_track_is_instrument(m_track) ? jackdaw_engine_list_midi_ports()
                                                               : jackdaw_engine_list_capture_ports();
-    if (ports) {
-        for (int i = 0; ports[i]; i++) {
-            BMessage *m = new BMessage(MSG_S_INPUT);
-            m->AddString("port", ports[i]);
-            m->AddInt32("index", i);
-            BMenuItem *it = new BMenuItem(port_short(ports[i]), m);
-            it->SetTarget(this);
-            m_input_menu->AddItem(it);
-        }
+    m_input->SetChoices(ports);
+    if (ports)
         jackdaw_engine_free_ports(ports);
-    }
 }
 
 void TrackStripView::RefreshInputs()
@@ -227,15 +199,8 @@ void TrackStripView::SyncFromTrack()
     m_vol->SetValue(trim_db);
     m_pan->SetValue((double)jackdaw_track_get_pan(m_track));
 
-    // Mark the current input source in the menu (MIDI or audio per track kind).
-    const char *src = instrument ? m_track->midi_src_port : m_track->audio_src_port;
-    for (int32 i = 0; i < m_input_menu->CountItems(); i++) {
-        BMenuItem *it = m_input_menu->ItemAt(i);
-        const char *port = "";
-        it->Message()->FindString("port", &port);
-        bool match = (!src && (!port || !*port)) || (src && port && strcmp(src, port) == 0);
-        it->SetMarked(match);
-    }
+    // Show the current input source (MIDI or audio per track kind).
+    m_input->SetSelected(instrument ? m_track->midi_src_port : m_track->audio_src_port);
 }
 
 void TrackStripView::SetPeaks(float l, float r)
