@@ -157,12 +157,13 @@ void TrackStripView::DetachedFromWindow()
 
 void TrackStripView::BuildInputMenu()
 {
-    // The sources the selector offers: audio capture ports for audio tracks,
-    // MIDI capture ports for instrument tracks. The selector builds its pop-up
-    // from these when it opens.
-    const char **ports = jackdaw_track_is_instrument(m_track) ? jackdaw_engine_list_midi_ports()
-                                                              : jackdaw_engine_list_capture_ports();
-    m_input->SetChoices(ports);
+    // The sources the selector offers: audio capture ports for audio tracks
+    // (with their stereo pairs), MIDI capture ports for instrument tracks. The
+    // selector builds its pop-up from these when it opens.
+    bool instrument = jackdaw_track_is_instrument(m_track);
+    const char **ports =
+        instrument ? jackdaw_engine_list_midi_ports() : jackdaw_engine_list_capture_ports();
+    m_input->SetChoices(ports, !instrument);
     if (ports)
         jackdaw_engine_free_ports(ports);
 }
@@ -200,7 +201,10 @@ void TrackStripView::SyncFromTrack()
     m_pan->SetValue((double)jackdaw_track_get_pan(m_track));
 
     // Show the current input source (MIDI or audio per track kind).
-    m_input->SetSelected(instrument ? m_track->midi_src_port : m_track->audio_src_port);
+    if (instrument)
+        m_input->SetSelected(m_track->midi_src_port);
+    else
+        m_input->SetSelected(m_track->audio_src_port, stereo ? m_track->audio_src_port_r : NULL);
 }
 
 void TrackStripView::SetPeaks(float l, float r)
@@ -386,9 +390,22 @@ void TrackStripView::MessageReceived(BMessage *message)
             if (jackdaw_track_is_instrument(m_track)) {
                 jackdaw_engine_set_midi_source(m_track, sel);
             } else {
-                jackdaw_engine_set_audio_source_l(m_track, sel);
-                if (jackdaw_track_is_stereo(m_track))
-                    ApplyStereo(true); // re-pair the right channel to the new source
+                const char *right = NULL;
+                if (sel && message->FindString("port_r", &right) == B_OK && right && *right) {
+                    // A stereo pair: the track becomes stereo, the pair's
+                    // channels feed its left and right.
+                    jackdaw_engine_set_track_stereo(m_track, TRUE);
+                    jackdaw_engine_set_audio_source_l(m_track, sel);
+                    jackdaw_engine_set_audio_source_r(m_track, right);
+                } else {
+                    jackdaw_engine_set_audio_source_l(m_track, sel);
+                    if (jackdaw_track_is_stereo(m_track)) {
+                        if (sel)
+                            ApplyStereo(true); // re-pair the right channel to the new source
+                        else
+                            jackdaw_engine_set_audio_source_r(m_track, NULL); // None: both
+                    }
+                }
             }
             SyncFromTrack();
             break;

@@ -16,8 +16,12 @@
 //
 // The pop-up is built when it opens: "None", then one item per port, grouped
 // in a submenu per device (the part before the first " / " of a Media Kit
-// name, the client of a JACK "client:port") when a device has several. A
-// chosen item Invokes a copy of the message with a "port" string ("" = none).
+// name, the client of a JACK "client:port") when a device has several. With
+// pairs offered, a device's submenu starts with its stereo pairs: two ports
+// whose names differ only in a trailing channel number n and n + 1, n odd
+// ("MediaPlayer audio out" "1+2", "input 0 / 1+2", JACK "capture_1+2"). A
+// chosen item Invokes a copy of the message with a "port" string ("" = none)
+// and, for a pair, a "port_r" string with the right channel.
 class PortSelector : public BView, public BInvoker
 {
 public:
@@ -32,17 +36,22 @@ public:
     BSize MaxSize() override;
     BSize PreferredSize() override;
 
-    // The ports the pop-up offers (full names, as the engine lists them).
-    void SetChoices(const char *const *ports);
-    // The selected port's full name; NULL or "" is none.
-    void SetSelected(const char *port);
+    // The ports the pop-up offers (full names, as the engine lists them),
+    // and whether it offers stereo pairs of them (audio, not MIDI).
+    void SetChoices(const char *const *ports, bool offerPairs);
+    // The selected port's full name, and the right channel's for a stereo
+    // source; NULL or "" is none.
+    void SetSelected(const char *port, const char *portRight = NULL);
 
 private:
     float FieldHeight();
     void UpdateToolTip();
-    BMessage *ItemMessage(const BString &port) const;
+    BMessage *ItemMessage(const BString &port, const BString &portRight) const;
+    bool Offered(const BString &port) const;
 
     std::vector<BString> m_choices;
+    bool m_offerPairs;
     BString m_selected;
+    BString m_selectedRight;
     bool m_hover;
 };
