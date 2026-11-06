@@ -345,9 +345,16 @@ struct Input {
     SRC_STATE *src = NULL;
     double srcRatio = 1.0;         // our rate / its rate
     double srcAdjust = 0.0;        // drift correction, another clock only
-    float *srcIn = NULL;           // one of its buffers, as float
+    float *srcIn = NULL;           // a slice of raw frames, as float
     float *srcOut = NULL;          // the same, converted
     uint32 srcInCap = 0, srcOutCap = 0; // frames
+    // Its frames as they came, at its rate, interleaved float; the cycle
+    // converts what it needs each period (_Convert), so a long buffer is not
+    // converted all at once on the thread that runs the cycle.
+    float *raw = NULL;
+    uint32 rawCap = 0;                 // frames, power of two
+    uint64 rawWritten = 0, rawRead = 0; // frames
+    bool ourClock = true; // its last buffer was stamped on our time source
     // The most frames one of its buffers brought (at our rate): a source
     // that sends long buffers (an app, 40 ms) is read once a whole one and
     // the usual margin are in, so it does not run dry between buffers.
@@ -534,8 +541,12 @@ private:
     void _UpdateLatency();
     void _RunCycle(bigtime_t performanceTime, bigtime_t lateness);
     void _FillInputs(bigtime_t performanceTime);
+    void _DropDeadInputs();
+    int32 fDeadCheck = 0; // cycles since the last _DropDeadInputs()
     void _WriteFifo(Input &in, const float *frames, uint32 count);
     uint32 _PrimeFrames(const Input &in) const;
+    uint64 _Avail(const Input &in) const;
+    void _Convert(Input &in, uint64 want, bool ourClock);
     Port *_RightPort(const Port &left);
     void _DiagCapture(int32 index, bigtime_t start, uint32 frames);
     void _DiagForgetCapture(int32 index);
@@ -678,6 +689,7 @@ JdMediaNode::~JdMediaNode()
             src_delete(fInputs[i].src);
         free(fInputs[i].srcIn);
         free(fInputs[i].srcOut);
+        free(fInputs[i].raw);
     }
 }
 
@@ -898,20 +910,25 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
     float *srcIn = NULL, *srcOut = NULL;
     uint32 srcInCap = 0, srcOutCap = 0;
     double ratio = rate > 0 ? fRate / rate : 1.0;
-    if (fabs(rate - fRate) > 0.5) {
+    float *raw = NULL;
+    uint32 rawCap = 0;
+    if (rate > 0 && fabs(rate - fRate) > 0.5) {
         size_t frameBytes = sample_size(format.u.raw_audio.format) * ch;
         srcInCap = frameBytes ? (uint32)(format.u.raw_audio.buffer_size / frameBytes) : 0;
         srcInCap = std::max(std::min(srcInCap, (uint32)65536), (uint32)4096);
         srcOutCap = (uint32)ceil(srcInCap * ratio * 1.01) + 64;
+        rawCap = next_pow2(srcInCap * 4);
+        raw = (float *)malloc((size_t)rawCap * ch * sizeof(float));
         int error = 0;
         src = src_new(SRC_SINC_MEDIUM_QUALITY, ch, &error);
         srcIn = (float *)malloc((size_t)srcInCap * ch * sizeof(float));
         srcOut = (float *)malloc((size_t)srcOutCap * ch * sizeof(float));
-        if (!src || !srcIn || !srcOut) {
+        if (!src || !srcIn || !srcOut || !raw) {
             if (src)
                 src_delete(src);
             free(srcIn);
             free(srcOut);
+            free(raw);
             return B_NO_MEMORY;
         }
     }
@@ -928,6 +945,7 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
             src_delete(src);
         free(srcIn);
         free(srcOut);
+        free(raw);
         return B_NO_MEMORY;
     }
 
@@ -938,6 +956,10 @@ status_t JdMediaNode::Connected(const media_source &producer, const media_destin
         src_delete(in->src);
     free(in->srcIn);
     free(in->srcOut);
+    free(in->raw);
+    in->raw = raw;
+    in->rawCap = rawCap;
+    in->rawWritten = in->rawRead = 0;
     in->fifo = fifo;
     in->scratch = scratch;
     in->capFrames = cap;
@@ -1007,38 +1029,21 @@ void JdMediaNode::BufferReceived(BBuffer *buffer)
     // How long it lasts, at its own rate.
     bigtime_t duration = a.frame_rate > 0 ? (bigtime_t)(1000000.0 * frames / a.frame_rate) : 0;
 
+    in->ourClock = ourClock;
     if (in->src) {
-        // A source on another clock drifts against ours: steer the rate so
-        // the FIFO holds what it should just before a buffer comes (the
-        // margin the cycle reads with), as PipeWire's adaptive resampling.
-        if (!ourClock && in->primed) {
-            double want = (double)_PrimeFrames(*in) - in->chunkFrames;
-            double have = (double)(in->written - in->read);
-            double error = (have - want) / fRate; // seconds too many
-            double adjust = -error * 0.05;
-            in->srcAdjust = std::max(-0.002, std::min(0.002, 0.9 * in->srcAdjust + 0.1 * adjust));
+        // Kept as it came; the cycle converts it (_Convert).
+        if (frames > in->rawCap)
+            frames = in->rawCap;
+        if (in->rawWritten - in->rawRead + frames > in->rawCap)
+            in->rawRead = in->rawWritten + frames - in->rawCap; // overflow: oldest go
+        uint32 mask = in->rawCap - 1;
+        for (uint32 f = 0; f < frames; f++) {
+            float *dst = in->raw + ((in->rawWritten + f) & mask) * in->channels;
+            for (int32 c = 0; c < in->channels; c++)
+                dst[c] = read_sample(src + (f * in->channels + c) * ss, a.format);
         }
-        uint32 made = 0;
-        for (uint32 done = 0; done < frames;) {
-            uint32 part = std::min(frames - done, in->srcInCap);
-            for (uint32 f = 0; f < part; f++)
-                for (int32 c = 0; c < in->channels; c++)
-                    in->srcIn[f * in->channels + c] =
-                        read_sample(src + ((done + f) * in->channels + c) * ss, a.format);
-            SRC_DATA d;
-            memset(&d, 0, sizeof d);
-            d.data_in = in->srcIn;
-            d.input_frames = part;
-            d.data_out = in->srcOut;
-            d.output_frames = in->srcOutCap;
-            d.src_ratio = in->srcRatio * (1.0 + in->srcAdjust);
-            d.end_of_input = 0;
-            if (src_process(in->src, &d) != 0 || d.input_frames_used == 0)
-                break;
-            _WriteFifo(*in, in->srcOut, (uint32)d.output_frames_gen);
-            made += (uint32)d.output_frames_gen;
-            done += (uint32)d.input_frames_used;
-        }
+        in->rawWritten += frames;
+        uint32 made = (uint32)(frames * in->srcRatio);
         if (made > in->chunkFrames)
             in->chunkFrames = std::min(made, in->capFrames / 4);
     } else {
@@ -1622,6 +1627,12 @@ void JdMediaNode::_RunCycle(bigtime_t performanceTime, bigtime_t lateness)
         notify_xrun();
     }
 
+    // About once a second: a producer that died left its input behind (the
+    // media server sends no notice for that).
+    if (++fDeadCheck * (int64)fPeriod >= (int64)fRate) {
+        fDeadCheck = 0;
+        _DropDeadInputs();
+    }
     _FillInputs(performanceTime);
     if (gCb.process)
         gCb.process((jd_nframes_t)fPeriod, gArg);
@@ -1633,6 +1644,22 @@ void JdMediaNode::_RunCycle(bigtime_t performanceTime, bigtime_t lateness)
     bigtime_t next = fStartTime + (bigtime_t)(1000000.0 * (double)fFramesSent / fRate);
     media_timed_event nextEvent(next, SEND_CYCLE_EVENT);
     EventQueue()->AddEvent(nextEvent);
+}
+
+/* A producer whose team went away (an app quit or crashed) never
+ * disconnects, so its input would stay listed, and run dry every cycle,
+ * for good. Its control port goes with the team: drop the inputs whose
+ * producer's port is gone, as their Disconnected would. Control thread. */
+void JdMediaNode::_DropDeadInputs()
+{
+    for (int32 i = 0; i < kMaxInputs; i++) {
+        Input &in = fInputs[i];
+        port_info info;
+        if (!in.connected || get_port_info(in.input.source.port, &info) == B_OK)
+            continue;
+        fprintf(stderr, "%s media: %s: its producer is gone\n", gNodeName, in.input.name);
+        Disconnected(in.input.source, in.input.destination);
+    }
 }
 
 /* Append interleaved frames to an input's FIFO; on overflow (a faster clock,
@@ -1653,6 +1680,57 @@ void JdMediaNode::_WriteFifo(Input &in, const float *frames, uint32 count)
     in.written += count;
 }
 
+/* Frames an input holds, at our rate: converted, and still to convert. */
+uint64 JdMediaNode::_Avail(const Input &in) const
+{
+    uint64 avail = in.written - in.read;
+    if (in.src)
+        avail += (uint64)((double)(in.rawWritten - in.rawRead) * in.srcRatio);
+    return avail;
+}
+
+/* Convert raw frames of a source at another rate until `want` frames are
+ * converted and unread, or the raw ones run out; a period's worth or so
+ * each cycle. A source on another clock drifts against ours, so its ratio is
+ * steered to keep the input at the margin the cycle reads with, as
+ * PipeWire's adaptive resampling. Control thread. */
+void JdMediaNode::_Convert(Input &in, uint64 want, bool ourClock)
+{
+    if (!ourClock && in.primed) {
+        // Between its buffers the input drains by one of them: aim the
+        // average at the middle of that.
+        double target = (double)_PrimeFrames(in) - in.chunkFrames / 2.0;
+        double error = ((double)_Avail(in) - target) / fRate; // seconds too many
+        double adjust = -error * 0.05;
+        in.srcAdjust = std::max(-0.002, std::min(0.002, 0.995 * in.srcAdjust + 0.005 * adjust));
+    }
+    uint32 mask = in.rawCap - 1;
+    while (in.written - in.read < want && in.rawWritten > in.rawRead) {
+        double ratio = in.srcRatio * (1.0 + in.srcAdjust);
+        uint64 need = want - (in.written - in.read);
+        uint32 part = (uint32)std::min<uint64>(in.rawWritten - in.rawRead,
+                                               (uint64)ceil(need / ratio) + 16);
+        part = std::min(part, in.srcInCap);
+        for (uint32 f = 0; f < part; f++)
+            memcpy(in.srcIn + (size_t)f * in.channels,
+                   in.raw + ((in.rawRead + f) & mask) * in.channels,
+                   sizeof(float) * in.channels);
+        SRC_DATA d;
+        memset(&d, 0, sizeof d);
+        d.data_in = in.srcIn;
+        d.input_frames = part;
+        d.data_out = in.srcOut;
+        d.output_frames = in.srcOutCap;
+        d.src_ratio = ratio;
+        if (src_process(in.src, &d) != 0 || d.input_frames_used == 0) {
+            in.rawRead = in.rawWritten; // give up on what is there
+            break;
+        }
+        in.rawRead += (uint64)d.input_frames_used;
+        _WriteFifo(in, in.srcOut, (uint32)d.output_frames_gen);
+    }
+}
+
 /* What an input must hold before the cycle starts reading it: its margin
  * (primeHalves half periods), plus, for a source that sends buffers longer
  * than our period, the rest of one of them, so it lasts until the next. */
@@ -1671,11 +1749,12 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
         Input &in = fInputs[i];
         if (!in.connected)
             continue;
-        uint64 avail = in.written - in.read;
+        uint64 avail = _Avail(in);
         // Frames of cycles that ran dry arrive late; drop them, so what
         // follows plays (and records) where it belongs in time.
         if (in.owed > 0) {
-            uint64 drop = in.owed < avail ? in.owed : avail;
+            uint64 converted = in.written - in.read;
+            uint64 drop = in.owed < converted ? in.owed : converted;
             in.read += drop;
             in.owed -= drop;
             avail -= drop;
@@ -1688,8 +1767,15 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
             // for the shorter lead).
             uint64 target = _PrimeFrames(in);
             if (avail > target) {
-                in.read = in.written - target;
-                avail = target;
+                uint64 excess = avail - target;
+                uint64 converted = in.written - in.read;
+                uint64 fromConverted = std::min(excess, converted);
+                in.read += fromConverted;
+                excess -= fromConverted;
+                if (excess > 0 && in.src)
+                    in.rawRead += std::min<uint64>(in.rawWritten - in.rawRead,
+                                                   (uint64)(excess / in.srcRatio));
+                avail = _Avail(in);
             }
             in.primed = true;
         }
@@ -1748,13 +1834,18 @@ void JdMediaNode::_FillInputs(bigtime_t performanceTime)
                 gDiag.capLatMax.store(frames, std::memory_order_relaxed);
         }
 
+        if (in.src)
+            _Convert(in, (uint64)fPeriod, in.ourClock);
+        // A converted input can fall a frame short of what _Avail() counted
+        // (the ratio is not exact): the rest of the period is silence.
+        int32 have = (int32)std::min<uint64>(in.written - in.read, (uint64)fPeriod);
         uint32 mask = in.capFrames - 1;
         for (int32 f = 0; f < fPeriod; f++) {
             const float *src = in.fifo + ((in.read + f) & mask) * in.channels;
             for (int32 c = 0; c < in.channels; c++)
-                in.scratch[c * fPeriod + f] = src[c];
+                in.scratch[c * fPeriod + f] = f < have ? src[c] : 0.0f;
         }
-        in.read += (uint64)fPeriod;
+        in.read += (uint64)have;
     }
 
     // Then each routed capture port copies its channel.
@@ -3361,6 +3452,21 @@ int mk_connect(const char *source, const char *destination)
     uint32 channels = s->output.format.u.raw_audio.channel_count;
     if (channels > 0 && channels <= (uint32)kMaxInChannels)
         fmt.u.raw_audio.channel_count = channels;
+    if (s->app) {
+        // An app keeps the format it had (MediaPlayer: the file's rate, 40 ms
+        // buffers) and we convert it, as the system mixer does. Left to us,
+        // it would convert to our rate itself and send a buffer per period,
+        // and MediaPlayer cannot read its file that fast at 1 ms: most of
+        // what it sent was silence.
+        const media_raw_audio_format &had = s->output.format.u.raw_audio;
+        const media_raw_audio_format &w = media_raw_audio_format::wildcard;
+        if (had.frame_rate != w.frame_rate)
+            fmt.u.raw_audio.frame_rate = had.frame_rate;
+        if (had.format != w.format)
+            fmt.u.raw_audio.format = had.format;
+        if (had.buffer_size != w.buffer_size)
+            fmt.u.raw_audio.buffer_size = had.buffer_size;
+    }
     media_output madeOut;
     media_input madeIn;
     media_destination jack(gNode->ControlPort(), kFreeJackBase + p);

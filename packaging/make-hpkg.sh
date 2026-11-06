@@ -10,7 +10,7 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 VERSION=$(cat "$ROOT/VERSION")   # the only place the version lives
-REVISION=5                       # bump for a rebuild of the same VERSION
+REVISION=9                       # bump for a rebuild of the same VERSION
 STAGE="$HERE/stage"
 
 pkgman install -y gcc make pkgconfig haiku_devel glib2_devel libsndfile_devel libsamplerate_devel || true
